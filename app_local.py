@@ -53,13 +53,12 @@ st.markdown("""
 @st.cache_resource
 def get_snowflake_connection():
     """
-    Create Snowflake connection using Streamlit secrets.
+    Create Snowflake connection using OAuth token authentication.
     
     Configure your connection in .streamlit/secrets.toml:
     [snowflake]
     account = "your_account"
-    user = "your_username"
-    password = "your_password"
+    token = "your_oauth_token"
     role = "ACCOUNTADMIN"
     warehouse = "your_warehouse"
     """
@@ -80,8 +79,7 @@ def get_snowflake_connection():
         ```toml
         [snowflake]
         account = "your_account"
-        user = "your_username"
-        password = "your_password"
+        token = "your_oauth_token"
         role = "ACCOUNTADMIN"
         warehouse = "your_warehouse"
         ```
@@ -134,18 +132,6 @@ with st.sidebar:
     - 🔒 **Security & Governance**
     - 💰 **Cost Optimization**
     """)
-    
-    st.markdown("---")
-    st.markdown("### Connection Info")
-    try:
-        conn_info = execute_query("SELECT CURRENT_ACCOUNT() as ACCOUNT, CURRENT_USER() as USER, CURRENT_ROLE() as ROLE, CURRENT_WAREHOUSE() as WAREHOUSE")
-        if not conn_info.empty:
-            st.text(f"Account: {conn_info['ACCOUNT'][0]}")
-            st.text(f"User: {conn_info['USER'][0]}")
-            st.text(f"Role: {conn_info['ROLE'][0]}")
-            st.text(f"Warehouse: {conn_info['WAREHOUSE'][0]}")
-    except:
-        pass
 
 # Main header
 st.markdown('<p class="main-header">❄️ Snowflake Well-Architected Framework Review</p>', unsafe_allow_html=True)
@@ -168,8 +154,170 @@ with tab1:
     Best practices from [Snowflake Well-Architected Framework - Performance](https://www.snowflake.com/en/developers/guides/well-architected-framework-performance/)
     """)
     
-    # Query 1: Warehouse Performance and Utilization
-    st.subheader("1. Warehouse Utilization & Efficiency")
+    # Query 1: Query Latency SLO (P50, P99)
+    st.subheader("1. Query Latency SLO Monitoring")
+    
+    query_latency_slo = f"""
+    WITH query_metrics AS (
+        SELECT 
+            DATE_TRUNC('day', start_time) as query_date,
+            query_type,
+            execution_time / 1000 as execution_time_sec
+        FROM snowflake.account_usage.query_history
+        WHERE start_time >= DATEADD(day, -{days_back}, CURRENT_TIMESTAMP())
+            AND execution_status = 'SUCCESS'
+            AND query_type IN ('SELECT', 'INSERT', 'UPDATE', 'DELETE', 'MERGE')
+    )
+    SELECT 
+        query_date,
+        query_type,
+        COUNT(*) as query_count,
+        PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY execution_time_sec) as p50_latency_sec,
+        PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY execution_time_sec) as p90_latency_sec,
+        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY execution_time_sec) as p95_latency_sec,
+        PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY execution_time_sec) as p99_latency_sec,
+        AVG(execution_time_sec) as avg_latency_sec,
+        MAX(execution_time_sec) as max_latency_sec
+    FROM query_metrics
+    GROUP BY query_date, query_type
+    ORDER BY query_date DESC, query_type
+    """
+    
+    try:
+        df_latency = execute_query(query_latency_slo)
+        
+        if not df_latency.empty:
+            # Overall SLO by query type
+            df_slo_summary = df_latency.groupby('QUERY_TYPE').agg({
+                'QUERY_COUNT': 'sum',
+                'P50_LATENCY_SEC': 'mean',
+                'P90_LATENCY_SEC': 'mean',
+                'P95_LATENCY_SEC': 'mean',
+                'P99_LATENCY_SEC': 'mean'
+            }).reset_index()
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                # P50 latency by query type
+                fig_p50 = px.bar(
+                    df_slo_summary,
+                    x='QUERY_TYPE',
+                    y='P50_LATENCY_SEC',
+                    title='P50 (Median) Latency by Query Type',
+                    labels={'P50_LATENCY_SEC': 'P50 Latency (sec)', 'QUERY_TYPE': 'Query Type'},
+                    color='P50_LATENCY_SEC',
+                    color_continuous_scale='Blues'
+                )
+                st.plotly_chart(fig_p50, use_container_width=True)
+            
+            with col2:
+                # P99 latency by query type
+                fig_p99 = px.bar(
+                    df_slo_summary,
+                    x='QUERY_TYPE',
+                    y='P99_LATENCY_SEC',
+                    title='P99 Latency by Query Type',
+                    labels={'P99_LATENCY_SEC': 'P99 Latency (sec)', 'QUERY_TYPE': 'Query Type'},
+                    color='P99_LATENCY_SEC',
+                    color_continuous_scale='Reds'
+                )
+                st.plotly_chart(fig_p99, use_container_width=True)
+            
+            # Latency trend over time for SELECT queries
+            df_select_trend = df_latency[df_latency['QUERY_TYPE'] == 'SELECT'].sort_values('QUERY_DATE')
+            
+            if not df_select_trend.empty:
+                fig_trend = go.Figure()
+                fig_trend.add_trace(go.Scatter(
+                    x=df_select_trend['QUERY_DATE'],
+                    y=df_select_trend['P50_LATENCY_SEC'],
+                    name='P50',
+                    mode='lines+markers',
+                    line=dict(color='green', width=2)
+                ))
+                fig_trend.add_trace(go.Scatter(
+                    x=df_select_trend['QUERY_DATE'],
+                    y=df_select_trend['P90_LATENCY_SEC'],
+                    name='P90',
+                    mode='lines+markers',
+                    line=dict(color='orange', width=2)
+                ))
+                fig_trend.add_trace(go.Scatter(
+                    x=df_select_trend['QUERY_DATE'],
+                    y=df_select_trend['P99_LATENCY_SEC'],
+                    name='P99',
+                    mode='lines+markers',
+                    line=dict(color='red', width=2)
+                ))
+                fig_trend.update_layout(
+                    title='SELECT Query Latency Trend (P50, P90, P99)',
+                    xaxis_title='Date',
+                    yaxis_title='Latency (seconds)',
+                    hovermode='x unified'
+                )
+                st.plotly_chart(fig_trend, use_container_width=True)
+            
+            # Summary metrics
+            overall_p50 = df_latency['P50_LATENCY_SEC'].mean()
+            overall_p90 = df_latency['P90_LATENCY_SEC'].mean()
+            overall_p95 = df_latency['P95_LATENCY_SEC'].mean()
+            overall_p99 = df_latency['P99_LATENCY_SEC'].mean()
+            
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Overall P50", f"{overall_p50:.2f}s")
+            with col2:
+                st.metric("Overall P90", f"{overall_p90:.2f}s")
+            with col3:
+                st.metric("Overall P95", f"{overall_p95:.2f}s")
+            with col4:
+                st.metric("Overall P99", f"{overall_p99:.2f}s")
+            
+            # Detailed SLO table
+            st.markdown("**SLO Details by Query Type:**")
+            st.dataframe(
+                df_slo_summary,
+                column_config={
+                    "QUERY_TYPE": "Query Type",
+                    "QUERY_COUNT": st.column_config.NumberColumn("Total Queries", format="%d"),
+                    "P50_LATENCY_SEC": st.column_config.NumberColumn("P50 (sec)", format="%.2f"),
+                    "P90_LATENCY_SEC": st.column_config.NumberColumn("P90 (sec)", format="%.2f"),
+                    "P95_LATENCY_SEC": st.column_config.NumberColumn("P95 (sec)", format="%.2f"),
+                    "P99_LATENCY_SEC": st.column_config.NumberColumn("P99 (sec)", format="%.2f")
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+            
+            # SLO violations check (example thresholds)
+            p99_threshold = 30  # 30 seconds for P99
+            high_p99_types = df_slo_summary[df_slo_summary['P99_LATENCY_SEC'] > p99_threshold]
+            
+            if not high_p99_types.empty:
+                st.markdown('<div class="warning-card">', unsafe_allow_html=True)
+                st.warning(f"⚠️ **SLO Alert**: {len(high_p99_types)} query type(s) have P99 latency >{p99_threshold}s. Review performance optimization opportunities.")
+                st.markdown('</div>', unsafe_allow_html=True)
+            else:
+                st.success(f"✅ All query types meet P99 latency SLO of <{p99_threshold}s")
+            
+            st.info("""
+            💡 **Latency Percentiles**:
+            - **P50 (Median)**: 50% of queries complete faster than this time
+            - **P90**: 90% of queries complete faster than this time
+            - **P99**: 99% of queries complete faster than this time
+            - Monitor P99 to ensure the slowest 1% of queries don't impact user experience
+            """)
+        else:
+            st.info("No latency data available for the selected period.")
+            
+    except Exception as e:
+        st.error(f"Error fetching latency SLO data: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Query 2: Warehouse Performance and Utilization
+    st.subheader("2. Warehouse Utilization & Efficiency")
     
     query_wh_utilization = f"""
     SELECT 
@@ -192,47 +340,552 @@ with tab1:
     try:
         df_wh_util = execute_query(query_wh_utilization)
         
-        if not df_wh_util.empty:
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                fig_queries = px.bar(
-                    df_wh_util.head(10),
-                    x='WAREHOUSE_NAME',
-                    y='TOTAL_QUERIES',
-                    title='Top 10 Warehouses by Query Volume',
-                    labels={'TOTAL_QUERIES': 'Number of Queries', 'WAREHOUSE_NAME': 'Warehouse'}
-                )
-                st.plotly_chart(fig_queries, use_container_width=True)
-            
-            with col2:
-                fig_queue = px.bar(
-                    df_wh_util.head(10),
-                    x='WAREHOUSE_NAME',
-                    y='QUEUE_TIME_PCT',
-                    title='Queue Time as % of Execution Time',
-                    labels={'QUEUE_TIME_PCT': 'Queue Time %', 'WAREHOUSE_NAME': 'Warehouse'},
-                    color='QUEUE_TIME_PCT',
-                    color_continuous_scale=['green', 'yellow', 'red']
-                )
-                st.plotly_chart(fig_queue, use_container_width=True)
-            
-            # Recommendations
-            high_queue_wh = df_wh_util[df_wh_util['QUEUE_TIME_PCT'] > 20]
-            if not high_queue_wh.empty:
-                st.markdown('<div class="warning-card">', unsafe_allow_html=True)
-                st.warning(f"⚠️ **Recommendation**: {len(high_queue_wh)} warehouse(s) have >20% queue time. Consider increasing warehouse size or enabling multi-cluster.")
-                st.dataframe(high_queue_wh[['WAREHOUSE_NAME', 'QUEUE_TIME_PCT', 'AVG_QUEUE_TIME_SEC']])
-                st.markdown('</div>', unsafe_allow_html=True)
-            else:
-                st.success("✅ No warehouses with excessive queue times detected.")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            fig_queries = px.bar(
+                df_wh_util.head(10),
+                x='WAREHOUSE_NAME',
+                y='TOTAL_QUERIES',
+                title='Top 10 Warehouses by Query Volume',
+                labels={'TOTAL_QUERIES': 'Number of Queries', 'WAREHOUSE_NAME': 'Warehouse'}
+            )
+            st.plotly_chart(fig_queries, use_container_width=True)
+        
+        with col2:
+            fig_queue = px.bar(
+                df_wh_util.head(10),
+                x='WAREHOUSE_NAME',
+                y='QUEUE_TIME_PCT',
+                title='Queue Time as % of Execution Time',
+                labels={'QUEUE_TIME_PCT': 'Queue Time %', 'WAREHOUSE_NAME': 'Warehouse'},
+                color='QUEUE_TIME_PCT',
+                color_continuous_scale=['green', 'yellow', 'red']
+            )
+            st.plotly_chart(fig_queue, use_container_width=True)
+        
+        # Recommendations
+        high_queue_wh = df_wh_util[df_wh_util['QUEUE_TIME_PCT'] > 20]
+        if not high_queue_wh.empty:
+            st.markdown('<div class="warning-card">', unsafe_allow_html=True)
+            st.warning(f"⚠️ **Recommendation**: {len(high_queue_wh)} warehouse(s) have >20% queue time. Consider increasing warehouse size or enabling multi-cluster.")
+            st.dataframe(high_queue_wh[['WAREHOUSE_NAME', 'QUEUE_TIME_PCT', 'AVG_QUEUE_TIME_SEC']])
+            st.markdown('</div>', unsafe_allow_html=True)
+        else:
+            st.success("✅ No warehouses with excessive queue times detected.")
                 
     except Exception as e:
         st.error(f"Error fetching warehouse utilization: {str(e)}")
     
     st.markdown("---")
-    st.info("💡 **Note**: This is the local version. For full functionality, see app.py for Snowflake-native Streamlit.")
-    st.markdown("Additional performance metrics are available in the full application.")
+    
+    # Query 2: Query Performance Analysis
+    st.subheader("3. Query Performance Analysis")
+    
+    query_performance = f"""
+    SELECT 
+        DATE_TRUNC('day', start_time) as query_date,
+        COUNT(*) as query_count,
+        AVG(execution_time) / 1000 as avg_exec_time_sec,
+        AVG(bytes_scanned) / POWER(1024, 3) as avg_gb_scanned,
+        AVG(partitions_scanned) as avg_partitions_scanned,
+        AVG(partitions_total) as avg_partitions_total,
+        COUNT(CASE WHEN execution_time > 60000 THEN 1 END) as slow_queries_count,
+        AVG(CASE 
+            WHEN partitions_total > 0 THEN (partitions_scanned::FLOAT / partitions_total) * 100 
+            ELSE 0 
+        END) as avg_partition_scan_pct
+    FROM snowflake.account_usage.query_history
+    WHERE start_time >= DATEADD(day, -{days_back}, CURRENT_TIMESTAMP())
+        AND execution_status = 'SUCCESS'
+        AND query_type IN ('SELECT', 'INSERT', 'UPDATE', 'DELETE', 'MERGE')
+    GROUP BY DATE_TRUNC('day', start_time)
+    ORDER BY query_date DESC
+    """
+    
+    try:
+        df_perf = execute_query(query_performance)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            fig_exec_time = px.line(
+                df_perf,
+                x='QUERY_DATE',
+                y='AVG_EXEC_TIME_SEC',
+                title='Average Query Execution Time Trend',
+                labels={'AVG_EXEC_TIME_SEC': 'Avg Execution Time (sec)', 'QUERY_DATE': 'Date'}
+            )
+            st.plotly_chart(fig_exec_time, use_container_width=True)
+        
+        with col2:
+            fig_partition = px.line(
+                df_perf,
+                x='QUERY_DATE',
+                y='AVG_PARTITION_SCAN_PCT',
+                title='Average Partition Scan Efficiency',
+                labels={'AVG_PARTITION_SCAN_PCT': 'Partitions Scanned %', 'QUERY_DATE': 'Date'}
+            )
+            st.plotly_chart(fig_partition, use_container_width=True)
+        
+        # Show metrics
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Total Queries", f"{df_perf['QUERY_COUNT'].sum():,.0f}")
+        with col2:
+            st.metric("Avg Execution Time", f"{df_perf['AVG_EXEC_TIME_SEC'].mean():.2f}s")
+        with col3:
+            st.metric("Slow Queries (>1min)", f"{df_perf['SLOW_QUERIES_COUNT'].sum():,.0f}")
+        with col4:
+            st.metric("Avg GB Scanned", f"{df_perf['AVG_GB_SCANNED'].mean():.2f}")
+        
+        # Recommendations
+        avg_partition_pct = df_perf['AVG_PARTITION_SCAN_PCT'].mean()
+        if avg_partition_pct > 50:
+            st.markdown('<div class="warning-card">', unsafe_allow_html=True)
+            st.warning(f"⚠️ **Recommendation**: Average partition scan is {avg_partition_pct:.1f}%. Consider adding clustering keys to frequently queried large tables to improve pruning.")
+            st.markdown('</div>', unsafe_allow_html=True)
+        else:
+            st.success(f"✅ Good partition pruning efficiency: {avg_partition_pct:.1f}% of partitions scanned on average.")
+            
+    except Exception as e:
+        st.error(f"Error fetching query performance: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Query 3: Clustering Information
+    st.subheader("4. Automatic Clustering Activity")
+    
+    query_clustering = f"""
+    SELECT 
+        database_name,
+        schema_name,
+        table_name,
+        COUNT(*) as reclustering_events,
+        SUM(credits_used) as total_credits_used,
+        SUM(num_bytes_reclustered) / POWER(1024, 3) as total_gb_reclustered,
+        SUM(num_rows_reclustered) as total_rows_reclustered,
+        AVG(credits_used) as avg_credits_per_event,
+        MAX(end_time) as last_reclustered
+    FROM snowflake.account_usage.automatic_clustering_history
+    WHERE start_time >= DATEADD(day, -{days_back}, CURRENT_TIMESTAMP())
+    GROUP BY database_name, schema_name, table_name
+    ORDER BY total_credits_used DESC
+    LIMIT 20
+    """
+    
+    try:
+        df_clustering = execute_query(query_clustering)
+        
+        if not df_clustering.empty:
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                fig_clustering_credits = px.bar(
+                    df_clustering.head(10),
+                    x='TABLE_NAME',
+                    y='TOTAL_CREDITS_USED',
+                    title='Top 10 Tables by Clustering Credits',
+                    labels={'TOTAL_CREDITS_USED': 'Credits Used', 'TABLE_NAME': 'Table'},
+                    color='TOTAL_CREDITS_USED',
+                    color_continuous_scale='Blues'
+                )
+                st.plotly_chart(fig_clustering_credits, use_container_width=True)
+            
+            with col2:
+                fig_clustering_events = px.bar(
+                    df_clustering.head(10),
+                    x='TABLE_NAME',
+                    y='RECLUSTERING_EVENTS',
+                    title='Top 10 Tables by Reclustering Events',
+                    labels={'RECLUSTERING_EVENTS': 'Number of Events', 'TABLE_NAME': 'Table'}
+                )
+                st.plotly_chart(fig_clustering_events, use_container_width=True)
+            
+            # Summary metrics
+            total_clustering_credits = df_clustering['TOTAL_CREDITS_USED'].sum()
+            total_gb_reclustered = df_clustering['TOTAL_GB_RECLUSTERED'].sum()
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Clustering Credits", f"{total_clustering_credits:.2f}")
+            with col2:
+                st.metric("Total GB Reclustered", f"{total_gb_reclustered:.2f}")
+            with col3:
+                st.metric("Tables with Clustering", len(df_clustering))
+            
+            st.markdown("**Detailed Clustering Activity:**")
+            st.dataframe(
+                df_clustering,
+                column_config={
+                    "DATABASE_NAME": "Database",
+                    "SCHEMA_NAME": "Schema",
+                    "TABLE_NAME": "Table",
+                    "RECLUSTERING_EVENTS": "Events",
+                    "TOTAL_CREDITS_USED": st.column_config.NumberColumn("Total Credits", format="%.2f"),
+                    "TOTAL_GB_RECLUSTERED": st.column_config.NumberColumn("GB Reclustered", format="%.2f"),
+                    "TOTAL_ROWS_RECLUSTERED": st.column_config.NumberColumn("Rows Reclustered", format="%.0f"),
+                    "AVG_CREDITS_PER_EVENT": st.column_config.NumberColumn("Avg Credits/Event", format="%.4f"),
+                    "LAST_RECLUSTERED": "Last Reclustered"
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+            
+            # Check for high clustering costs
+            high_cost_tables = df_clustering[df_clustering['TOTAL_CREDITS_USED'] > 1.0]
+            if not high_cost_tables.empty:
+                st.markdown('<div class="warning-card">', unsafe_allow_html=True)
+                st.warning(f"⚠️ **{len(high_cost_tables)} table(s) with >1 credit in clustering costs**. Review clustering key effectiveness and consider manual optimization.")
+                st.markdown('</div>', unsafe_allow_html=True)
+            
+            st.info("💡 **Tip**: High reclustering activity may indicate frequent DML operations on clustered tables. Evaluate if clustering keys are optimal for your query patterns.")
+        else:
+            st.info("ℹ️ No automatic clustering activity detected in the selected period. This may indicate no clustered tables or no reclustering was needed.")
+            
+    except Exception as e:
+        st.info(f"Clustering analysis unavailable: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Query 4: Result Cache Hit Rate
+    st.subheader("5. Result Cache Efficiency")
+    
+    query_cache = f"""
+    WITH cache_analysis AS (
+        SELECT 
+            DATE_TRUNC('day', start_time) as query_date,
+            query_id,
+            query_type,
+            execution_status,
+            bytes_scanned,
+            partitions_scanned,
+            execution_time,
+            CASE 
+                WHEN execution_status = 'SUCCESS' 
+                    AND bytes_scanned = 0 
+                    AND partitions_scanned = 0
+                    AND execution_time < 1000  -- Less than 1 second (likely cache hit)
+                THEN 1 
+                ELSE 0 
+            END as is_cache_hit
+        FROM snowflake.account_usage.query_history
+        WHERE start_time >= DATEADD(day, -{days_back}, CURRENT_TIMESTAMP())
+            AND query_type = 'SELECT'
+            AND execution_status = 'SUCCESS'
+    )
+    SELECT 
+        query_date,
+        COUNT(*) as total_queries,
+        SUM(is_cache_hit) as cache_hits,
+        (SUM(is_cache_hit)::FLOAT / COUNT(*)) * 100 as cache_hit_rate,
+        AVG(execution_time) / 1000 as avg_execution_time_sec
+    FROM cache_analysis
+    GROUP BY query_date
+    ORDER BY query_date DESC
+    """
+    
+    try:
+        df_cache = execute_query(query_cache)
+        
+        if not df_cache.empty:
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                fig_cache = px.line(
+                    df_cache,
+                    x='QUERY_DATE',
+                    y='CACHE_HIT_RATE',
+                    title='Result Cache Hit Rate Over Time',
+                    labels={'CACHE_HIT_RATE': 'Cache Hit Rate (%)', 'QUERY_DATE': 'Date'},
+                    markers=True
+                )
+                fig_cache.add_hline(y=50, line_dash="dash", line_color="orange", annotation_text="Target: >50%")
+                st.plotly_chart(fig_cache, use_container_width=True)
+            
+            with col2:
+                # Cache hits vs total queries
+                fig_cache_volume = go.Figure()
+                fig_cache_volume.add_trace(go.Bar(
+                    x=df_cache['QUERY_DATE'],
+                    y=df_cache['TOTAL_QUERIES'],
+                    name='Total Queries',
+                    marker_color='lightblue'
+                ))
+                fig_cache_volume.add_trace(go.Bar(
+                    x=df_cache['QUERY_DATE'],
+                    y=df_cache['CACHE_HITS'],
+                    name='Cache Hits',
+                    marker_color='green'
+                ))
+                fig_cache_volume.update_layout(
+                    title='Query Volume: Total vs Cache Hits',
+                    xaxis_title='Date',
+                    yaxis_title='Number of Queries',
+                    barmode='overlay'
+                )
+                st.plotly_chart(fig_cache_volume, use_container_width=True)
+            
+            # Summary metrics
+            avg_cache_rate = df_cache['CACHE_HIT_RATE'].mean()
+            total_queries = df_cache['TOTAL_QUERIES'].sum()
+            total_cache_hits = df_cache['CACHE_HITS'].sum()
+            avg_exec_time = df_cache['AVG_EXECUTION_TIME_SEC'].mean()
+            
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Avg Cache Hit Rate", f"{avg_cache_rate:.1f}%")
+            with col2:
+                st.metric("Total Queries", f"{total_queries:,.0f}")
+            with col3:
+                st.metric("Total Cache Hits", f"{total_cache_hits:,.0f}")
+            with col4:
+                st.metric("Avg Query Time", f"{avg_exec_time:.2f}s")
+            
+            # Recommendations
+            if avg_cache_rate < 30:
+                st.markdown('<div class="warning-card">', unsafe_allow_html=True)
+                st.warning(f"⚠️ **Recommendation**: Cache hit rate is {avg_cache_rate:.1f}%. This may indicate unique queries or short cache retention. Review query patterns for optimization opportunities.")
+                st.markdown('</div>', unsafe_allow_html=True)
+            else:
+                st.success(f"✅ Good cache utilization: {avg_cache_rate:.1f}% hit rate.")
+            
+            st.info("💡 **Note**: Result cache hits are identified by queries that scan 0 bytes/partitions and complete in <1 second, indicating data was retrieved from cache rather than storage.")
+        else:
+            st.info("No cache data available for the selected period.")
+            
+    except Exception as e:
+        st.error(f"Error fetching cache data: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Query 5: Warehouse Timeout Configuration
+    st.subheader("6. Warehouse Timeout Configuration")
+    
+    try:
+        # Get warehouse list using SHOW WAREHOUSES
+        df_wh_params = execute_query("SHOW WAREHOUSES")
+        
+        # Standardize column names - handle both quoted and unquoted column names
+        column_mapping = {}
+        for col in df_wh_params.columns:
+            col_clean = str(col).lower().strip('"').strip()
+            if col_clean == 'name':
+                column_mapping[col] = 'WAREHOUSE_NAME'
+        
+        df_wh_params.rename(columns=column_mapping, inplace=True)
+        
+        # Try to identify columns by position if name-based mapping didn't work
+        if 'WAREHOUSE_NAME' not in df_wh_params.columns:
+            if len(df_wh_params.columns) > 0:
+                df_wh_params['WAREHOUSE_NAME'] = df_wh_params.iloc[:, 0]
+        
+        # Get timeout parameters for each warehouse
+        warehouses = df_wh_params['WAREHOUSE_NAME'].tolist()
+        
+        timeout_data = []
+        for wh in warehouses:
+            try:
+                # Get warehouse parameters
+                params_df = execute_query(f"SHOW PARAMETERS FOR WAREHOUSE {wh}")
+                
+                # Find timeout parameters
+                stmt_timeout = None
+                queue_timeout = None
+                
+                for _, row in params_df.iterrows():
+                    param_name = str(row.iloc[0]).strip('"').strip().upper() if len(row) > 0 else ''
+                    param_value = str(row.iloc[1]).strip('"').strip() if len(row) > 1 else '0'
+                    
+                    if 'STATEMENT_TIMEOUT_IN_SECONDS' in param_name:
+                        stmt_timeout = int(param_value) if param_value.isdigit() else 0
+                    elif 'STATEMENT_QUEUED_TIMEOUT_IN_SECONDS' in param_name:
+                        queue_timeout = int(param_value) if param_value.isdigit() else 0
+                
+                timeout_data.append({
+                    'WAREHOUSE_NAME': wh,
+                    'STATEMENT_TIMEOUT_IN_SECONDS': stmt_timeout,
+                    'STATEMENT_QUEUED_TIMEOUT_IN_SECONDS': queue_timeout
+                })
+            except Exception as e:
+                st.warning(f"Could not retrieve parameters for warehouse {wh}: {str(e)}")
+        
+        if timeout_data:
+            df_params_pivot = pd.DataFrame(timeout_data)
+            
+            # Check for missing configurations
+            no_stmt_timeout = df_params_pivot[df_params_pivot['STATEMENT_TIMEOUT_IN_SECONDS'].isnull() | 
+                                              (df_params_pivot['STATEMENT_TIMEOUT_IN_SECONDS'] == 0)]
+            no_queue_timeout = df_params_pivot[df_params_pivot['STATEMENT_QUEUED_TIMEOUT_IN_SECONDS'].isnull() | 
+                                               (df_params_pivot['STATEMENT_QUEUED_TIMEOUT_IN_SECONDS'] == 0)]
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Warehouses", len(df_params_pivot))
+            with col2:
+                st.metric("Missing Statement Timeout", len(no_stmt_timeout))
+            with col3:
+                st.metric("Missing Queue Timeout", len(no_queue_timeout))
+            
+            # Display warehouse timeout configuration
+            st.markdown("**Timeout Configuration Details:**")
+            st.dataframe(
+                df_params_pivot,
+                column_config={
+                    "WAREHOUSE_NAME": "Warehouse",
+                    "STATEMENT_TIMEOUT_IN_SECONDS": st.column_config.NumberColumn("Statement Timeout (sec)", format="%d"),
+                    "STATEMENT_QUEUED_TIMEOUT_IN_SECONDS": st.column_config.NumberColumn("Queue Timeout (sec)", format="%d")
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+            
+            # Recommendations
+            if not no_stmt_timeout.empty:
+                st.markdown('<div class="warning-card">', unsafe_allow_html=True)
+                st.warning(f"⚠️ **{len(no_stmt_timeout)} warehouse(s) without statement timeout**. Configure STATEMENT_TIMEOUT_IN_SECONDS to prevent runaway queries.")
+                st.markdown('</div>', unsafe_allow_html=True)
+            
+            if not no_queue_timeout.empty:
+                st.markdown('<div class="warning-card">', unsafe_allow_html=True)
+                st.warning(f"⚠️ **{len(no_queue_timeout)} warehouse(s) without queue timeout**. Configure STATEMENT_QUEUED_TIMEOUT_IN_SECONDS to prevent long queue waits.")
+                st.markdown('</div>', unsafe_allow_html=True)
+            
+            if no_stmt_timeout.empty and no_queue_timeout.empty:
+                st.success("✅ All warehouses have timeout configurations.")
+            
+            st.info("💡 **Best Practice**: Set STATEMENT_TIMEOUT_IN_SECONDS (e.g., 3600) and STATEMENT_QUEUED_TIMEOUT_IN_SECONDS (e.g., 300) to prevent resource exhaustion.")
+        else:
+            st.info("No warehouse timeout configuration data available.")
+            
+    except Exception as e:
+        st.error(f"Error fetching warehouse timeout configuration: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Query 6: Query Spillage Detection
+    st.subheader("7. Query Spillage Detection")
+    
+    query_spillage = f"""
+    SELECT 
+        DATE_TRUNC('day', start_time) as query_date,
+        warehouse_name,
+        COUNT(*) as total_queries,
+        SUM(CASE WHEN bytes_spilled_to_local_storage > 0 THEN 1 ELSE 0 END) as queries_with_local_spill,
+        SUM(CASE WHEN bytes_spilled_to_remote_storage > 0 THEN 1 ELSE 0 END) as queries_with_remote_spill,
+        SUM(bytes_spilled_to_local_storage) / POWER(1024, 3) as total_local_spill_gb,
+        SUM(bytes_spilled_to_remote_storage) / POWER(1024, 3) as total_remote_spill_gb,
+        AVG(CASE WHEN bytes_spilled_to_local_storage > 0 
+            THEN bytes_spilled_to_local_storage / POWER(1024, 3) 
+            ELSE 0 END) as avg_local_spill_gb,
+        AVG(CASE WHEN bytes_spilled_to_remote_storage > 0 
+            THEN bytes_spilled_to_remote_storage / POWER(1024, 3) 
+            ELSE 0 END) as avg_remote_spill_gb,
+        (SUM(CASE WHEN bytes_spilled_to_local_storage > 0 THEN 1 ELSE 0 END)::FLOAT / COUNT(*)) * 100 as local_spill_pct,
+        (SUM(CASE WHEN bytes_spilled_to_remote_storage > 0 THEN 1 ELSE 0 END)::FLOAT / COUNT(*)) * 100 as remote_spill_pct
+    FROM snowflake.account_usage.query_history
+    WHERE start_time >= DATEADD(day, -{days_back}, CURRENT_TIMESTAMP())
+        AND warehouse_name IS NOT NULL
+        AND execution_status = 'SUCCESS'
+    GROUP BY DATE_TRUNC('day', start_time), warehouse_name
+    HAVING queries_with_local_spill > 0 OR queries_with_remote_spill > 0
+    ORDER BY total_local_spill_gb + total_remote_spill_gb DESC
+    """
+    
+    try:
+        df_spillage = execute_query(query_spillage)
+        
+        if not df_spillage.empty:
+            # Aggregate by warehouse
+            df_spillage_by_wh = df_spillage.groupby('WAREHOUSE_NAME').agg({
+                'QUERIES_WITH_LOCAL_SPILL': 'sum',
+                'QUERIES_WITH_REMOTE_SPILL': 'sum',
+                'TOTAL_LOCAL_SPILL_GB': 'sum',
+                'TOTAL_REMOTE_SPILL_GB': 'sum',
+                'LOCAL_SPILL_PCT': 'mean',
+                'REMOTE_SPILL_PCT': 'mean'
+            }).reset_index()
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                fig_local_spill = px.bar(
+                    df_spillage_by_wh.head(10),
+                    x='WAREHOUSE_NAME',
+                    y='TOTAL_LOCAL_SPILL_GB',
+                    title='Top 10 Warehouses by Local Disk Spillage',
+                    labels={'TOTAL_LOCAL_SPILL_GB': 'Local Spill (GB)', 'WAREHOUSE_NAME': 'Warehouse'},
+                    color='TOTAL_LOCAL_SPILL_GB',
+                    color_continuous_scale='Oranges'
+                )
+                st.plotly_chart(fig_local_spill, use_container_width=True)
+            
+            with col2:
+                fig_remote_spill = px.bar(
+                    df_spillage_by_wh.head(10),
+                    x='WAREHOUSE_NAME',
+                    y='TOTAL_REMOTE_SPILL_GB',
+                    title='Top 10 Warehouses by Remote Storage Spillage',
+                    labels={'TOTAL_REMOTE_SPILL_GB': 'Remote Spill (GB)', 'WAREHOUSE_NAME': 'Warehouse'},
+                    color='TOTAL_REMOTE_SPILL_GB',
+                    color_continuous_scale='Reds'
+                )
+                st.plotly_chart(fig_remote_spill, use_container_width=True)
+            
+            # Summary metrics
+            total_local_spill = df_spillage_by_wh['TOTAL_LOCAL_SPILL_GB'].sum()
+            total_remote_spill = df_spillage_by_wh['TOTAL_REMOTE_SPILL_GB'].sum()
+            total_queries_with_spill = df_spillage_by_wh['QUERIES_WITH_LOCAL_SPILL'].sum() + df_spillage_by_wh['QUERIES_WITH_REMOTE_SPILL'].sum()
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Local Spillage", f"{total_local_spill:.2f} GB")
+            with col2:
+                st.metric("Total Remote Spillage", f"{total_remote_spill:.2f} GB")
+            with col3:
+                st.metric("Queries with Spillage", f"{total_queries_with_spill:,.0f}")
+            
+            st.markdown("**Spillage Details by Warehouse:**")
+            st.dataframe(
+                df_spillage_by_wh,
+                column_config={
+                    "WAREHOUSE_NAME": "Warehouse",
+                    "QUERIES_WITH_LOCAL_SPILL": st.column_config.NumberColumn("Queries w/ Local Spill", format="%d"),
+                    "QUERIES_WITH_REMOTE_SPILL": st.column_config.NumberColumn("Queries w/ Remote Spill", format="%d"),
+                    "TOTAL_LOCAL_SPILL_GB": st.column_config.NumberColumn("Local Spill (GB)", format="%.2f"),
+                    "TOTAL_REMOTE_SPILL_GB": st.column_config.NumberColumn("Remote Spill (GB)", format="%.2f"),
+                    "LOCAL_SPILL_PCT": st.column_config.NumberColumn("Local Spill %", format="%.2f"),
+                    "REMOTE_SPILL_PCT": st.column_config.NumberColumn("Remote Spill %", format="%.2f")
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+            
+            # Check for high spillage
+            high_local_spill = df_spillage_by_wh[df_spillage_by_wh['LOCAL_SPILL_PCT'] > 5]
+            high_remote_spill = df_spillage_by_wh[df_spillage_by_wh['REMOTE_SPILL_PCT'] > 1]
+            
+            if not high_local_spill.empty:
+                st.markdown('<div class="warning-card">', unsafe_allow_html=True)
+                st.warning(f"⚠️ **{len(high_local_spill)} warehouse(s) with >5% local disk spillage**. Consider increasing warehouse size to add more memory.")
+                st.markdown('</div>', unsafe_allow_html=True)
+            
+            if not high_remote_spill.empty:
+                st.markdown('<div class="danger-card">', unsafe_allow_html=True)
+                st.error(f"⚠️ **Critical: {len(high_remote_spill)} warehouse(s) with >1% remote storage spillage**. This severely impacts performance. Increase warehouse size immediately.")
+                st.markdown('</div>', unsafe_allow_html=True)
+            
+            st.info("""
+            💡 **Spillage Information**:
+            - **Local Disk Spillage**: Occurs when query memory exceeds available warehouse memory. Data spills to local SSD.
+            - **Remote Storage Spillage**: Occurs when local disk is full. Data spills to remote storage (S3/Azure/GCS). **Severe performance impact**.
+            - **Recommendation**: If spillage occurs frequently, increase warehouse size to provide more memory.
+            """)
+        else:
+            st.success("✅ No significant query spillage detected in the selected period.")
+            
+    except Exception as e:
+        st.error(f"Error fetching spillage data: {str(e)}")
 
 # ============================================================================
 # TAB 2: RELIABILITY
@@ -243,7 +896,185 @@ with tab2:
     Best practices from [Snowflake Well-Architected Framework - Reliability](https://www.snowflake.com/en/developers/guides/well-architected-framework-reliability/)
     """)
     
-    st.info("💡 **Note**: This is the local version. For full functionality, see app.py for Snowflake-native Streamlit.")
+    # Query 1: Database Configuration & Resilience
+    st.subheader("1. Database Configuration & Resilience")
+    
+    query_databases = """
+    SELECT 
+        database_name,
+        database_owner,
+        type,
+        is_transient,
+        retention_time,
+        created,
+        last_altered,
+        CASE 
+            WHEN type = 'IMPORTED DATABASE' THEN 'Replicated from Share'
+            WHEN type = 'STANDARD' THEN 'Standard Database'
+            WHEN type = 'APPLICATION' THEN 'Native App'
+            WHEN type = 'APPLICATION_PACKAGE' THEN 'App Package'
+            ELSE type
+        END as database_type_desc,
+        DATEDIFF(day, created, CURRENT_TIMESTAMP()) as age_days
+    FROM snowflake.account_usage.databases
+    WHERE deleted IS NULL
+    ORDER BY database_name
+    """
+    
+    try:
+        df_databases = execute_query(query_databases)
+        
+        if not df_databases.empty:
+            # Analyze database types
+            type_counts = df_databases['DATABASE_TYPE_DESC'].value_counts()
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                fig_db_types = px.pie(
+                    values=type_counts.values,
+                    names=type_counts.index,
+                    title='Database Types Distribution',
+                    hole=0.4
+                )
+                st.plotly_chart(fig_db_types, use_container_width=True)
+            
+            with col2:
+                # Retention time distribution
+                fig_retention = px.histogram(
+                    df_databases,
+                    x='RETENTION_TIME',
+                    title='Time Travel Retention Distribution (Days)',
+                    labels={'RETENTION_TIME': 'Retention Days', 'count': 'Number of Databases'},
+                    nbins=20
+                )
+                st.plotly_chart(fig_retention, use_container_width=True)
+            
+            # Summary metrics
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Total Databases", len(df_databases))
+            with col2:
+                transient_count = len(df_databases[df_databases['IS_TRANSIENT'] == 'YES'])
+                st.metric("Transient Databases", transient_count)
+            with col3:
+                avg_retention = df_databases['RETENTION_TIME'].mean()
+                st.metric("Avg Retention Time", f"{avg_retention:.0f} days")
+            with col4:
+                imported_count = len(df_databases[df_databases['TYPE'] == 'IMPORTED DATABASE'])
+                st.metric("Replicated Databases", imported_count)
+            
+            # Check for potential issues
+            low_retention = df_databases[df_databases['RETENTION_TIME'] < 1]
+            transient_dbs = df_databases[df_databases['IS_TRANSIENT'] == 'YES']
+            
+            if not low_retention.empty:
+                st.markdown('<div class="danger-card">', unsafe_allow_html=True)
+                st.error(f"⚠️ **Critical**: {len(low_retention)} database(s) have Time Travel retention < 1 day. This limits disaster recovery options!")
+                st.dataframe(
+                    low_retention[['DATABASE_NAME', 'DATABASE_TYPE_DESC', 'RETENTION_TIME', 'IS_TRANSIENT']],
+                    hide_index=True,
+                    use_container_width=True
+                )
+                st.markdown('</div>', unsafe_allow_html=True)
+            
+            if not transient_dbs.empty:
+                st.markdown('<div class="warning-card">', unsafe_allow_html=True)
+                st.warning(f"⚠️ **Warning**: {len(transient_dbs)} transient database(s) have reduced Fail-safe protection (0 days vs 7 days for standard databases).")
+                st.markdown('</div>', unsafe_allow_html=True)
+            
+            # Detailed database information
+            st.markdown("**Database Configuration Details:**")
+            st.dataframe(
+                df_databases[[
+                    'DATABASE_NAME', 'DATABASE_OWNER', 'DATABASE_TYPE_DESC', 
+                    'IS_TRANSIENT', 'RETENTION_TIME', 'AGE_DAYS', 'CREATED'
+                ]],
+                column_config={
+                    "DATABASE_NAME": "Database",
+                    "DATABASE_OWNER": "Owner Role",
+                    "DATABASE_TYPE_DESC": "Type",
+                    "IS_TRANSIENT": "Transient",
+                    "RETENTION_TIME": st.column_config.NumberColumn("Time Travel (days)", format="%d"),
+                    "AGE_DAYS": st.column_config.NumberColumn("Age (days)", format="%d"),
+                    "CREATED": "Created Date"
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+            
+            # Recommendations
+            st.info("""
+            💡 **Reliability Best Practices**:
+            - **Time Travel**: Standard databases should have 1-90 days retention for disaster recovery
+            - **Transient Databases**: Use only for non-critical data (no Fail-safe protection)
+            - **Database Replication**: Configure replication to secondary regions for critical databases
+            - **Imported Databases**: Monitor share providers for data availability
+            """)
+            
+        else:
+            st.info("No databases found in the account.")
+            
+    except Exception as e:
+        st.error(f"Error fetching database information: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Query 2: Failed Queries and Error Analysis
+    st.subheader("2. Query Failures & Error Analysis")
+    
+    query_failures = f"""
+    SELECT 
+        DATE_TRUNC('day', start_time) as failure_date,
+        error_code,
+        error_message,
+        COUNT(*) as failure_count
+    FROM snowflake.account_usage.query_history
+    WHERE start_time >= DATEADD(day, -{days_back}, CURRENT_TIMESTAMP())
+        AND execution_status IN ('FAILED', 'INCIDENT')
+    GROUP BY DATE_TRUNC('day', start_time), error_code, error_message
+    ORDER BY failure_count DESC
+    LIMIT 20
+    """
+    
+    try:
+        df_failures = execute_query(query_failures)
+        
+        if not df_failures.empty:
+            # Total failures over time
+            df_failures_trend = df_failures.groupby('FAILURE_DATE')['FAILURE_COUNT'].sum().reset_index()
+            
+            fig_failures = px.line(
+                df_failures_trend,
+                x='FAILURE_DATE',
+                y='FAILURE_COUNT',
+                title='Query Failures Over Time',
+                labels={'FAILURE_COUNT': 'Number of Failures', 'FAILURE_DATE': 'Date'}
+            )
+            st.plotly_chart(fig_failures, use_container_width=True)
+            
+            st.markdown('<div class="danger-card">', unsafe_allow_html=True)
+            st.error(f"⚠️ **{df_failures['FAILURE_COUNT'].sum():,.0f} query failures** detected in the last {days_back} days")
+            st.markdown('</div>', unsafe_allow_html=True)
+            
+            st.markdown("**Top Error Messages:**")
+            st.dataframe(
+                df_failures[['ERROR_CODE', 'ERROR_MESSAGE', 'FAILURE_COUNT']].head(10),
+                column_config={
+                    "ERROR_CODE": "Error Code",
+                    "ERROR_MESSAGE": st.column_config.TextColumn("Error Message", width="large"),
+                    "FAILURE_COUNT": "Count"
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+            
+            st.info("💡 **Tip**: Review error patterns and implement proper error handling, retries, and alerting.")
+        else:
+            st.success("✅ No query failures detected in the selected period.")
+            
+    except Exception as e:
+        st.error(f"Error fetching failure data: {str(e)}")
 
 # ============================================================================
 # TAB 3: OPERATIONAL EXCELLENCE
@@ -254,7 +1085,181 @@ with tab3:
     Best practices from [Snowflake Well-Architected Framework - Operational Excellence](https://www.snowflake.com/en/developers/guides/well-architected-framework-operational-excellence/)
     """)
     
-    st.info("💡 **Note**: This is the local version. For full functionality, see app.py for Snowflake-native Streamlit.")
+    # Query 1: Resource Monitors
+    st.subheader("1. Resource Monitoring & Governance")
+    
+    query_resource_monitors = """
+    SELECT 
+        name,
+        'level' as monitor_level,
+        TO_NUMBER(credit_quota, 38, 2) as credit_quota,
+        TO_NUMBER(used_credits, 38, 2) as used_credits,
+        remaining_credits,
+        notify,
+        suspend,
+        suspend_immediate,
+        owner,
+        created
+    FROM snowflake.account_usage.resource_monitors
+    ORDER BY credit_quota DESC
+    """
+    
+    try:
+        df_monitors = execute_query(query_resource_monitors)
+        
+        if not df_monitors.empty:
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.metric("Total Monitors", len(df_monitors))
+            with col2:
+                account_level = len(df_monitors[df_monitors['MONITOR_LEVEL'] == 'ACCOUNT'])
+                st.metric("Account-Level", account_level)
+            with col3:
+                total_quota = df_monitors['CREDIT_QUOTA'].sum()
+                st.metric("Total Credit Quota", f"{total_quota:,.0f}")
+            with col4:
+                total_used = df_monitors['USED_CREDITS'].sum()
+                st.metric("Total Credits Used", f"{total_used:,.0f}")
+            
+            # Usage percentage
+            df_monitors['USAGE_PCT'] = (df_monitors['USED_CREDITS'] / df_monitors['CREDIT_QUOTA'] * 100).fillna(0)
+            
+            # Check for monitors approaching quota
+            approaching_quota = df_monitors[df_monitors['USAGE_PCT'] > 80]
+            if not approaching_quota.empty:
+                st.markdown('<div class="warning-card">', unsafe_allow_html=True)
+                st.warning(f"⚠️ **{len(approaching_quota)} resource monitor(s) have used >80% of credit quota**")
+                st.markdown('</div>', unsafe_allow_html=True)
+            
+            st.success("✅ Resource monitors are configured to control credit usage.")
+        else:
+            st.markdown('<div class="danger-card">', unsafe_allow_html=True)
+            st.error("⚠️ **Critical**: No resource monitors configured. Set up resource monitors to control credit usage and prevent runaway costs.")
+            st.markdown('</div>', unsafe_allow_html=True)
+            st.info("💡 **Recommendation**: Create at least one account-level resource monitor with SUSPEND and NOTIFY thresholds.")
+            
+    except Exception as e:
+        st.error(f"Error fetching resource monitors: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Query 2: Warehouse Auto-Suspend Configuration
+    st.subheader("2. Warehouse Auto-Suspend & Auto-Resume")
+    
+    try:
+        # Use SHOW WAREHOUSES instead of account_usage view
+        df_wh_config = execute_query("SHOW WAREHOUSES")
+        
+        # Rename columns for consistency - handle both quoted and unquoted column names
+        column_mapping = {}
+        for col in df_wh_config.columns:
+            col_lower = col.lower()
+            if col_lower == 'name':
+                column_mapping[col] = 'WAREHOUSE_NAME'
+            elif col_lower == 'size':
+                column_mapping[col] = 'WAREHOUSE_SIZE'
+            elif col_lower == 'type':
+                column_mapping[col] = 'WAREHOUSE_TYPE'
+            elif col_lower == 'auto_suspend':
+                column_mapping[col] = 'AUTO_SUSPEND'
+            elif col_lower == 'auto_resume':
+                column_mapping[col] = 'AUTO_RESUME'
+        
+        df_wh_config.rename(columns=column_mapping, inplace=True)
+        
+        # Check for warehouses without auto-suspend (NULL or 0)
+        no_auto_suspend = df_wh_config[df_wh_config['AUTO_SUSPEND'].isnull() | (df_wh_config['AUTO_SUSPEND'] == 0)]
+        long_auto_suspend = df_wh_config[df_wh_config['AUTO_SUSPEND'] > 600]
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("Total Warehouses", len(df_wh_config))
+        with col2:
+            st.metric("No Auto-Suspend", len(no_auto_suspend))
+        with col3:
+            st.metric("Auto-Suspend > 10min", len(long_auto_suspend))
+        
+        if len(no_auto_suspend) > 0:
+            st.markdown('<div class="danger-card">', unsafe_allow_html=True)
+            st.error(f"⚠️ **Critical**: {len(no_auto_suspend)} warehouse(s) without auto-suspend will run continuously!")
+            st.dataframe(no_auto_suspend[['WAREHOUSE_NAME', 'WAREHOUSE_SIZE', 'AUTO_SUSPEND', 'AUTO_RESUME']], hide_index=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+        
+        if len(long_auto_suspend) > 0:
+            st.markdown('<div class="warning-card">', unsafe_allow_html=True)
+            st.warning(f"⚠️ **Recommendation**: {len(long_auto_suspend)} warehouse(s) have auto-suspend > 10 minutes. Consider reducing to 60-300 seconds for cost optimization.")
+            st.dataframe(long_auto_suspend[['WAREHOUSE_NAME', 'WAREHOUSE_SIZE', 'AUTO_SUSPEND']], hide_index=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+        
+        if len(no_auto_suspend) == 0 and len(long_auto_suspend) == 0:
+            st.success("✅ All warehouses have appropriate auto-suspend configuration.")
+            
+    except Exception as e:
+        st.error(f"Error fetching warehouse configuration: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Query 3: Long-Running Queries
+    st.subheader("3. Long-Running Query Detection")
+    
+    query_long_queries = f"""
+    SELECT 
+        query_id,
+        user_name,
+        warehouse_name,
+        query_type,
+        execution_time / 1000 as execution_time_sec,
+        total_elapsed_time / 1000 as total_elapsed_time_sec,
+        bytes_scanned / POWER(1024, 3) as gb_scanned,
+        start_time
+    FROM snowflake.account_usage.query_history
+    WHERE start_time >= DATEADD(day, -{days_back}, CURRENT_TIMESTAMP())
+        AND execution_status = 'SUCCESS'
+        AND execution_time > 300000  -- Greater than 5 minutes
+    ORDER BY execution_time DESC
+    LIMIT 50
+    """
+    
+    try:
+        df_long_queries = execute_query(query_long_queries)
+        
+        if not df_long_queries.empty:
+            st.markdown('<div class="warning-card">', unsafe_allow_html=True)
+            st.warning(f"⚠️ **{len(df_long_queries)} queries took longer than 5 minutes** to execute")
+            st.markdown('</div>', unsafe_allow_html=True)
+            
+            fig_long_queries = px.histogram(
+                df_long_queries,
+                x='EXECUTION_TIME_SEC',
+                nbins=30,
+                title='Distribution of Long-Running Queries',
+                labels={'EXECUTION_TIME_SEC': 'Execution Time (seconds)'}
+            )
+            st.plotly_chart(fig_long_queries, use_container_width=True)
+            
+            st.dataframe(
+                df_long_queries.head(20),
+                column_config={
+                    "QUERY_ID": "Query ID",
+                    "USER_NAME": "User",
+                    "WAREHOUSE_NAME": "Warehouse",
+                    "QUERY_TYPE": "Type",
+                    "EXECUTION_TIME_SEC": st.column_config.NumberColumn("Execution Time (sec)", format="%.2f"),
+                    "GB_SCANNED": st.column_config.NumberColumn("GB Scanned", format="%.2f"),
+                    "START_TIME": "Start Time"
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+            
+            st.info("💡 **Tip**: Review these queries for optimization opportunities (e.g., adding filters, indexes, materialized views).")
+        else:
+            st.success("✅ No long-running queries detected.")
+            
+    except Exception as e:
+        st.error(f"Error fetching long-running queries: {str(e)}")
 
 # ============================================================================
 # TAB 4: SECURITY & GOVERNANCE
@@ -265,7 +1270,154 @@ with tab4:
     Best practices from [Snowflake Well-Architected Framework - Security & Governance](https://www.snowflake.com/en/developers/guides/well-architected-framework-security-and-governance/)
     """)
     
-    st.info("💡 **Note**: This is the local version. For full functionality, see app.py for Snowflake-native Streamlit.")
+    # Query 1: MFA Adoption
+    st.subheader("1. Multi-Factor Authentication (MFA)")
+    
+    query_mfa = """
+    SELECT 
+        CASE 
+            WHEN ext_authn_duo = TRUE THEN 'MFA Enabled'
+            ELSE 'MFA Not Enabled'
+        END as mfa_status,
+        COUNT(*) as user_count
+    FROM snowflake.account_usage.users
+    WHERE deleted_on IS NULL
+        AND disabled = FALSE
+    GROUP BY mfa_status
+    """
+    
+    try:
+        df_mfa = execute_query(query_mfa)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            fig_mfa = px.pie(
+                df_mfa,
+                values='USER_COUNT',
+                names='MFA_STATUS',
+                title='MFA Adoption Rate',
+                color='MFA_STATUS',
+                color_discrete_map={'MFA Enabled': '#28a745', 'MFA Not Enabled': '#dc3545'}
+            )
+            st.plotly_chart(fig_mfa, use_container_width=True)
+        
+        with col2:
+            total_users = df_mfa['USER_COUNT'].sum()
+            mfa_enabled = df_mfa[df_mfa['MFA_STATUS'] == 'MFA Enabled']['USER_COUNT'].sum() if 'MFA Enabled' in df_mfa['MFA_STATUS'].values else 0
+            mfa_rate = (mfa_enabled / total_users * 100) if total_users > 0 else 0
+            
+            st.metric("Total Active Users", total_users)
+            st.metric("MFA Enabled", mfa_enabled)
+            st.metric("MFA Adoption Rate", f"{mfa_rate:.1f}%")
+        
+        if mfa_rate < 100:
+            st.markdown('<div class="danger-card">', unsafe_allow_html=True)
+            st.error(f"⚠️ **Critical**: Only {mfa_rate:.1f}% of users have MFA enabled. Require MFA for all users to enhance security.")
+            st.markdown('</div>', unsafe_allow_html=True)
+        else:
+            st.success("✅ All active users have MFA enabled.")
+            
+    except Exception as e:
+        st.error(f"Error fetching MFA data: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Query 2: Network Policies
+    st.subheader("2. Network Policy Configuration")
+    
+    query_network_policy = """
+    SELECT 
+        name as policy_name,
+        allowed_ip_list,
+        blocked_ip_list,
+        comment
+    FROM snowflake.account_usage.network_policies
+    WHERE deleted IS NULL
+    ORDER BY name
+    """
+    
+    try:
+        df_network_policy = execute_query(query_network_policy)
+        
+        if not df_network_policy.empty:
+            st.success(f"✅ {len(df_network_policy)} network polic(ies) configured")
+            
+            st.dataframe(
+                df_network_policy,
+                column_config={
+                    "POLICY_NAME": "Policy Name",
+                    "ALLOWED_IP_LIST": st.column_config.TextColumn("Allowed IPs", width="large"),
+                    "BLOCKED_IP_LIST": st.column_config.TextColumn("Blocked IPs", width="large"),
+                    "COMMENT": "Comment"
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+        else:
+            st.markdown('<div class="warning-card">', unsafe_allow_html=True)
+            st.warning("⚠️ **Recommendation**: No network policies configured. Implement network policies to restrict access to trusted IP ranges.")
+            st.markdown('</div>', unsafe_allow_html=True)
+            
+    except Exception as e:
+        st.error(f"Error fetching network policies: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Query 3: Failed Login Attempts
+    st.subheader("3. Failed Authentication Attempts")
+    
+    query_failed_logins = f"""
+    SELECT 
+        user_name,
+        error_message,
+        COUNT(*) as failed_attempts,
+        MAX(event_timestamp) as last_attempt
+    FROM snowflake.account_usage.login_history
+    WHERE event_timestamp >= DATEADD(day, -{days_back}, CURRENT_TIMESTAMP())
+        AND is_success = 'NO'
+    GROUP BY user_name, error_message
+    ORDER BY failed_attempts DESC
+    LIMIT 30
+    """
+    
+    try:
+        df_failed_logins = execute_query(query_failed_logins)
+        
+        if not df_failed_logins.empty:
+            total_failures = df_failed_logins['FAILED_ATTEMPTS'].sum()
+            
+            st.markdown('<div class="warning-card">', unsafe_allow_html=True)
+            st.warning(f"⚠️ **{total_failures:,.0f} failed login attempts** detected")
+            st.markdown('</div>', unsafe_allow_html=True)
+            
+            fig_failed = px.bar(
+                df_failed_logins.head(15),
+                x='USER_NAME',
+                y='FAILED_ATTEMPTS',
+                title='Failed Login Attempts by User',
+                labels={'FAILED_ATTEMPTS': 'Failed Attempts', 'USER_NAME': 'User'}
+            )
+            st.plotly_chart(fig_failed, use_container_width=True)
+            
+            st.dataframe(
+                df_failed_logins.head(20),
+                column_config={
+                    "USER_NAME": "User",
+                    "ERROR_MESSAGE": st.column_config.TextColumn("Error Message", width="large"),
+                    "FAILED_ATTEMPTS": "Failed Attempts",
+                    "LAST_ATTEMPT": "Last Attempt"
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+            
+            st.info("💡 **Tip**: Investigate users with multiple failed login attempts. Consider implementing account lockout policies.")
+        else:
+            st.success("✅ No failed login attempts in the selected period.")
+            
+    except Exception as e:
+        st.error(f"Error fetching failed login data: {str(e)}")
 
 # ============================================================================
 # TAB 5: COST OPTIMIZATION
@@ -276,7 +1428,630 @@ with tab5:
     Best practices from [Snowflake Well-Architected Framework - Cost Optimization](https://www.snowflake.com/en/developers/guides/well-architected-framework-cost-optimization-and-finops/)
     """)
     
-    st.info("💡 **Note**: This is the local version. For full functionality, see app.py for Snowflake-native Streamlit.")
+    # Query 1: Credit Usage by Service
+    st.subheader("1. Credit Consumption Overview")
+    
+    query_credit_usage = f"""
+    SELECT 
+        DATE_TRUNC('day', usage_date) as usage_date,
+        service_type,
+        SUM(credits_used) as total_credits
+    FROM snowflake.account_usage.metering_daily_history
+    WHERE usage_date >= DATEADD(day, -{days_back}, CURRENT_TIMESTAMP())
+    GROUP BY DATE_TRUNC('day', usage_date), service_type
+    ORDER BY usage_date DESC, total_credits DESC
+    """
+    
+    try:
+        df_credits = execute_query(query_credit_usage)
+        
+        # Total credits by service type
+        df_credits_by_service = df_credits.groupby('SERVICE_TYPE')['TOTAL_CREDITS'].sum().reset_index()
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            fig_credits_pie = px.pie(
+                df_credits_by_service,
+                values='TOTAL_CREDITS',
+                names='SERVICE_TYPE',
+                title='Credit Distribution by Service Type',
+                hole=0.4
+            )
+            st.plotly_chart(fig_credits_pie, use_container_width=True)
+        
+        with col2:
+            # Credits over time
+            fig_credits_trend = px.area(
+                df_credits,
+                x='USAGE_DATE',
+                y='TOTAL_CREDITS',
+                color='SERVICE_TYPE',
+                title='Daily Credit Consumption Trend',
+                labels={'TOTAL_CREDITS': 'Credits Used', 'USAGE_DATE': 'Date'}
+            )
+            st.plotly_chart(fig_credits_trend, use_container_width=True)
+        
+        # Metrics
+        total_credits = df_credits['TOTAL_CREDITS'].sum()
+        avg_daily_credits = df_credits.groupby('USAGE_DATE')['TOTAL_CREDITS'].sum().mean()
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Total Credits Used", f"{total_credits:,.2f}")
+        with col2:
+            st.metric("Avg Daily Credits", f"{avg_daily_credits:,.2f}")
+        with col3:
+            st.metric("Estimated Monthly", f"{avg_daily_credits * 30:,.2f}")
+            
+    except Exception as e:
+        st.error(f"Error fetching credit usage: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Query 2: Warehouse Cost Analysis
+    st.subheader("2. Warehouse Cost Analysis")
+    
+    query_wh_cost = f"""
+    SELECT 
+        warehouse_name,
+        SUM(credits_used) as total_credits,
+        SUM(credits_used_compute) as compute_credits,
+        SUM(credits_used_cloud_services) as cloud_services_credits,
+        AVG(CASE 
+            WHEN credits_used > 0 THEN (credits_used_cloud_services / credits_used) * 100 
+            ELSE 0 
+        END) as cloud_services_pct
+    FROM snowflake.account_usage.warehouse_metering_history
+    WHERE start_time >= DATEADD(day, -{days_back}, CURRENT_TIMESTAMP())
+    GROUP BY warehouse_name
+    ORDER BY total_credits DESC
+    LIMIT 20
+    """
+    
+    try:
+        df_wh_cost = execute_query(query_wh_cost)
+        
+        if not df_wh_cost.empty:
+            fig_wh_cost = px.bar(
+                df_wh_cost.head(15),
+                x='WAREHOUSE_NAME',
+                y='TOTAL_CREDITS',
+                title='Top 15 Warehouses by Credit Consumption',
+                labels={'TOTAL_CREDITS': 'Total Credits', 'WAREHOUSE_NAME': 'Warehouse'},
+                color='TOTAL_CREDITS',
+                color_continuous_scale='Reds'
+            )
+            st.plotly_chart(fig_wh_cost, use_container_width=True)
+            
+            st.markdown("**Warehouse Cost Breakdown:**")
+            st.dataframe(
+                df_wh_cost,
+                column_config={
+                    "WAREHOUSE_NAME": "Warehouse",
+                    "TOTAL_CREDITS": st.column_config.NumberColumn("Total Credits", format="%.2f"),
+                    "COMPUTE_CREDITS": st.column_config.NumberColumn("Compute Credits", format="%.2f"),
+                    "CLOUD_SERVICES_CREDITS": st.column_config.NumberColumn("Cloud Services Credits", format="%.2f"),
+                    "CLOUD_SERVICES_PCT": st.column_config.NumberColumn("Cloud Services %", format="%.2f")
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+            
+            # Check for high cloud services usage
+            high_cs_wh = df_wh_cost[df_wh_cost['CLOUD_SERVICES_PCT'] > 10]
+            if not high_cs_wh.empty:
+                st.markdown('<div class="warning-card">', unsafe_allow_html=True)
+                st.warning(f"⚠️ **{len(high_cs_wh)} warehouse(s) with >10% cloud services credits**. You may be charged for cloud services if this exceeds the daily limit.")
+                st.markdown('</div>', unsafe_allow_html=True)
+            
+    except Exception as e:
+        st.error(f"Error fetching warehouse cost data: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Query 3: Storage Costs
+    st.subheader("3. Storage Cost Analysis")
+    
+    query_storage = f"""
+    SELECT 
+        DATE_TRUNC('day', usage_date) as usage_date,
+        AVG(storage_bytes + stage_bytes + failsafe_bytes) / POWER(1024, 4) as total_storage_tb,
+        AVG(storage_bytes) / POWER(1024, 4) as database_storage_tb,
+        AVG(stage_bytes) / POWER(1024, 4) as stage_storage_tb,
+        AVG(failsafe_bytes) / POWER(1024, 4) as failsafe_storage_tb
+    FROM snowflake.account_usage.storage_usage
+    WHERE usage_date >= DATEADD(day, -{days_back}, CURRENT_TIMESTAMP())
+    GROUP BY DATE_TRUNC('day', usage_date)
+    ORDER BY usage_date DESC
+    """
+    
+    try:
+        df_storage = execute_query(query_storage)
+        
+        if not df_storage.empty:
+            fig_storage = px.area(
+                df_storage,
+                x='USAGE_DATE',
+                y=['DATABASE_STORAGE_TB', 'STAGE_STORAGE_TB', 'FAILSAFE_STORAGE_TB'],
+                title='Storage Usage Trend (TB)',
+                labels={'value': 'Storage (TB)', 'USAGE_DATE': 'Date', 'variable': 'Storage Type'}
+            )
+            st.plotly_chart(fig_storage, use_container_width=True)
+            
+            latest_storage = df_storage.iloc[0]
+            
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Total Storage", f"{latest_storage['TOTAL_STORAGE_TB']:.2f} TB")
+            with col2:
+                st.metric("Database Storage", f"{latest_storage['DATABASE_STORAGE_TB']:.2f} TB")
+            with col3:
+                st.metric("Stage Storage", f"{latest_storage['STAGE_STORAGE_TB']:.2f} TB")
+            with col4:
+                st.metric("Failsafe Storage", f"{latest_storage['FAILSAFE_STORAGE_TB']:.2f} TB")
+            
+            # Calculate growth
+            if len(df_storage) > 7:
+                storage_7d_ago = df_storage.iloc[-1]['TOTAL_STORAGE_TB']
+                storage_growth = ((latest_storage['TOTAL_STORAGE_TB'] - storage_7d_ago) / storage_7d_ago) * 100
+                
+                if storage_growth > 10:
+                    st.markdown('<div class="warning-card">', unsafe_allow_html=True)
+                    st.warning(f"⚠️ **Storage growth**: {storage_growth:.1f}% increase in the last 7 days. Review data retention policies and remove unused data.")
+                    st.markdown('</div>', unsafe_allow_html=True)
+            
+    except Exception as e:
+        st.error(f"Error fetching storage data: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Query 4: Idle Warehouse Detection
+    st.subheader("4. Idle Warehouse Detection")
+    
+    try:
+        # Get warehouse list using SHOW WAREHOUSES
+        df_warehouses = execute_query("SHOW WAREHOUSES")
+        
+        # Rename columns for consistency
+        column_mapping = {}
+        for col in df_warehouses.columns:
+            col_lower = col.lower()
+            if col_lower == 'name':
+                column_mapping[col] = 'WAREHOUSE_NAME'
+            elif col_lower == 'size':
+                column_mapping[col] = 'WAREHOUSE_SIZE'
+            elif col_lower == 'state':
+                column_mapping[col] = 'STATE'
+        
+        df_warehouses.rename(columns=column_mapping, inplace=True)
+        
+        # Get warehouse usage from query history
+        query_usage = f"""
+        SELECT 
+            warehouse_name,
+            MAX(end_time) as last_used
+        FROM snowflake.account_usage.query_history
+        WHERE start_time >= DATEADD(day, -{days_back}, CURRENT_TIMESTAMP())
+        GROUP BY warehouse_name
+        """
+        
+        df_usage = execute_query(query_usage)
+        
+        # Merge warehouses with usage data
+        df_idle_wh = df_warehouses[['WAREHOUSE_NAME', 'WAREHOUSE_SIZE']].merge(
+            df_usage,
+            left_on='WAREHOUSE_NAME',
+            right_on='WAREHOUSE_NAME',
+            how='left'
+        )
+        
+        # Calculate days since last use
+        current_time = pd.Timestamp.now(tz='UTC')
+        df_idle_wh['DAYS_SINCE_LAST_USE'] = df_idle_wh['LAST_USED'].apply(
+            lambda x: (current_time - pd.to_datetime(x, utc=True)).days if pd.notna(x) else None
+        )
+        
+        # Sort by days since last use (nulls first)
+        df_idle_wh = df_idle_wh.sort_values('DAYS_SINCE_LAST_USE', ascending=False, na_position='first')
+        
+        # Warehouses not used in last 7 days
+        idle_wh = df_idle_wh[(df_idle_wh['DAYS_SINCE_LAST_USE'].isnull()) | (df_idle_wh['DAYS_SINCE_LAST_USE'] > 7)]
+        
+        if not idle_wh.empty:
+            st.markdown('<div class="warning-card">', unsafe_allow_html=True)
+            st.warning(f"⚠️ **{len(idle_wh)} idle warehouse(s)** detected (not used in 7+ days)")
+            st.markdown('</div>', unsafe_allow_html=True)
+            
+            st.dataframe(
+                idle_wh,
+                column_config={
+                    "WAREHOUSE_NAME": "Warehouse",
+                    "WAREHOUSE_SIZE": "Size",
+                    "LAST_USED": "Last Used",
+                    "DAYS_SINCE_LAST_USE": "Days Since Last Use"
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+            
+            st.info("💡 **Tip**: Consider suspending or dropping unused warehouses to reduce costs.")
+        else:
+            st.success("✅ All warehouses have been used recently.")
+            
+    except Exception as e:
+        st.error(f"Error fetching idle warehouse data: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Query 5: Storage Optimization Opportunities
+    st.subheader("5. Storage Optimization Opportunities")
+    
+    query_table_storage = f"""
+    WITH table_storage AS (
+        SELECT 
+            table_catalog,
+            table_schema,
+            table_name,
+            active_bytes / POWER(1024, 3) as active_gb,
+            time_travel_bytes / POWER(1024, 3) as time_travel_gb,
+            failsafe_bytes / POWER(1024, 3) as failsafe_gb,
+            (active_bytes + time_travel_bytes + failsafe_bytes) / POWER(1024, 3) as total_gb
+        FROM snowflake.account_usage.table_storage_metrics
+        WHERE deleted IS NULL
+    ),
+    table_access AS (
+        SELECT 
+            tables_accessed.value:objectName::STRING as table_name,
+            COUNT(*) as access_count
+        FROM snowflake.account_usage.access_history,
+            LATERAL FLATTEN(input => base_objects_accessed) tables_accessed
+        WHERE query_start_time >= DATEADD(day, -{days_back}, CURRENT_TIMESTAMP())
+        GROUP BY table_name
+    )
+    SELECT 
+        ts.table_catalog,
+        ts.table_schema,
+        ts.table_name,
+        ts.total_gb,
+        ts.active_gb,
+        ts.time_travel_gb,
+        ts.failsafe_gb,
+        COALESCE(ta.access_count, 0) as access_count
+    FROM table_storage ts
+    LEFT JOIN table_access ta ON ts.table_name = ta.table_name
+    WHERE ts.total_gb > 1  -- Tables larger than 1 GB
+    ORDER BY ts.total_gb DESC
+    LIMIT 50
+    """
+    
+    try:
+        df_table_storage = execute_query(query_table_storage)
+        
+        if not df_table_storage.empty:
+            # Tables with high storage but low access
+            unused_tables = df_table_storage[
+                (df_table_storage['TOTAL_GB'] > 10) & 
+                (df_table_storage['ACCESS_COUNT'] == 0)
+            ]
+            
+            fig_storage_table = px.scatter(
+                df_table_storage.head(30),
+                x='ACCESS_COUNT',
+                y='TOTAL_GB',
+                size='TOTAL_GB',
+                hover_data=['TABLE_CATALOG', 'TABLE_SCHEMA', 'TABLE_NAME'],
+                title='Table Storage vs Access Frequency',
+                labels={'TOTAL_GB': 'Storage (GB)', 'ACCESS_COUNT': 'Access Count'},
+                color='TOTAL_GB',
+                color_continuous_scale='Reds'
+            )
+            st.plotly_chart(fig_storage_table, use_container_width=True)
+            
+            if not unused_tables.empty:
+                st.markdown('<div class="warning-card">', unsafe_allow_html=True)
+                st.warning(f"⚠️ **{len(unused_tables)} large table(s) (>10GB)** with no access in the last {days_back} days")
+                st.markdown('</div>', unsafe_allow_html=True)
+                
+                st.dataframe(
+                    unused_tables.head(20),
+                    column_config={
+                        "TABLE_CATALOG": "Database",
+                        "TABLE_SCHEMA": "Schema",
+                        "TABLE_NAME": "Table",
+                        "TOTAL_GB": st.column_config.NumberColumn("Total Storage (GB)", format="%.2f"),
+                        "ACTIVE_GB": st.column_config.NumberColumn("Active (GB)", format="%.2f"),
+                        "TIME_TRAVEL_GB": st.column_config.NumberColumn("Time Travel (GB)", format="%.2f"),
+                        "FAILSAFE_GB": st.column_config.NumberColumn("Failsafe (GB)", format="%.2f"),
+                        "ACCESS_COUNT": "Access Count"
+                    },
+                    hide_index=True,
+                    use_container_width=True
+                )
+                
+                st.info("💡 **Tip**: Review these tables for archival or deletion. Consider reducing data retention periods.")
+            else:
+                st.success("✅ All large tables are actively accessed.")
+                
+    except Exception as e:
+        st.error(f"Error fetching table storage data: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Query 6: Tables Storage Usage with Time Travel
+    st.subheader("6. Tables Storage Usage with Time Travel")
+    
+    query_time_travel_storage = """
+    SELECT 
+        table_catalog as database_name,
+        table_schema as schema_name,
+        table_name,
+        active_bytes / POWER(1024, 3) as active_storage_gb,
+        time_travel_bytes / POWER(1024, 3) as time_travel_storage_gb,
+        failsafe_bytes / POWER(1024, 3) as failsafe_storage_gb,
+        (active_bytes + time_travel_bytes + failsafe_bytes) / POWER(1024, 3) as total_storage_gb,
+        CASE 
+            WHEN active_bytes > 0 THEN (time_travel_bytes / active_bytes) * 100
+            ELSE 0
+        END as time_travel_percentage,
+        CASE 
+            WHEN active_bytes > 0 THEN (failsafe_bytes / active_bytes) * 100
+            ELSE 0
+        END as failsafe_percentage,
+        deleted
+    FROM snowflake.account_usage.table_storage_metrics
+    WHERE deleted IS NULL
+        AND (active_bytes + time_travel_bytes + failsafe_bytes) > 0
+    ORDER BY time_travel_storage_gb DESC
+    LIMIT 100
+    """
+    
+    try:
+        df_time_travel = execute_query(query_time_travel_storage)
+        
+        if not df_time_travel.empty:
+            # Summary metrics
+            total_active = df_time_travel['ACTIVE_STORAGE_GB'].sum()
+            total_time_travel = df_time_travel['TIME_TRAVEL_STORAGE_GB'].sum()
+            total_failsafe = df_time_travel['FAILSAFE_STORAGE_GB'].sum()
+            total_storage = df_time_travel['TOTAL_STORAGE_GB'].sum()
+            
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Total Active Storage", f"{total_active:.2f} GB")
+            with col2:
+                st.metric("Time Travel Storage", f"{total_time_travel:.2f} GB")
+            with col3:
+                st.metric("Failsafe Storage", f"{total_failsafe:.2f} GB")
+            with col4:
+                time_travel_pct = (total_time_travel / total_active * 100) if total_active > 0 else 0
+                st.metric("Time Travel Overhead", f"{time_travel_pct:.1f}%")
+            
+            # Visualization: Storage breakdown
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                # Top tables by time travel storage
+                fig_tt = px.bar(
+                    df_time_travel.head(15),
+                    x='TABLE_NAME',
+                    y='TIME_TRAVEL_STORAGE_GB',
+                    title='Top 15 Tables by Time Travel Storage',
+                    labels={'TIME_TRAVEL_STORAGE_GB': 'Time Travel Storage (GB)', 'TABLE_NAME': 'Table'},
+                    color='TIME_TRAVEL_STORAGE_GB',
+                    color_continuous_scale='Oranges'
+                )
+                fig_tt.update_xaxis(tickangle=-45)
+                st.plotly_chart(fig_tt, use_container_width=True)
+            
+            with col2:
+                # Storage composition pie chart
+                storage_breakdown = pd.DataFrame({
+                    'Type': ['Active', 'Time Travel', 'Failsafe'],
+                    'Storage_GB': [total_active, total_time_travel, total_failsafe]
+                })
+                fig_pie = px.pie(
+                    storage_breakdown,
+                    values='Storage_GB',
+                    names='Type',
+                    title='Storage Composition',
+                    color_discrete_sequence=['#29b5e8', '#ff7f0e', '#d62728']
+                )
+                st.plotly_chart(fig_pie, use_container_width=True)
+            
+            # Tables with high time travel overhead
+            high_tt_overhead = df_time_travel[df_time_travel['TIME_TRAVEL_PERCENTAGE'] > 100]
+            
+            if not high_tt_overhead.empty:
+                st.markdown('<div class="warning-card">', unsafe_allow_html=True)
+                st.warning(f"⚠️ **{len(high_tt_overhead)} table(s) with Time Travel storage >100% of active data**")
+                st.markdown('</div>', unsafe_allow_html=True)
+                
+                st.markdown("**Tables with High Time Travel Overhead:**")
+                st.dataframe(
+                    high_tt_overhead.head(20),
+                    column_config={
+                        "DATABASE_NAME": "Database",
+                        "SCHEMA_NAME": "Schema",
+                        "TABLE_NAME": "Table",
+                        "ACTIVE_STORAGE_GB": st.column_config.NumberColumn("Active (GB)", format="%.2f"),
+                        "TIME_TRAVEL_STORAGE_GB": st.column_config.NumberColumn("Time Travel (GB)", format="%.2f"),
+                        "FAILSAFE_STORAGE_GB": st.column_config.NumberColumn("Failsafe (GB)", format="%.2f"),
+                        "TOTAL_STORAGE_GB": st.column_config.NumberColumn("Total (GB)", format="%.2f"),
+                        "TIME_TRAVEL_PERCENTAGE": st.column_config.NumberColumn("Time Travel %", format="%.1f"),
+                        "FAILSAFE_PERCENTAGE": st.column_config.NumberColumn("Failsafe %", format="%.1f")
+                    },
+                    hide_index=True,
+                    use_container_width=True
+                )
+            
+            st.info("""
+            💡 **Time Travel & Failsafe Information**:
+            - **Time Travel**: Allows querying historical data (default 1 day, configurable up to 90 days for Enterprise Edition)
+            - **Failsafe**: 7-day period after Time Travel for disaster recovery (Snowflake-managed)
+            - **Cost Impact**: Both Time Travel and Failsafe storage incur storage costs
+            - **Optimization**: Consider reducing DATA_RETENTION_TIME_IN_DAYS for tables with high overhead
+            - Use `ALTER TABLE <table_name> SET DATA_RETENTION_TIME_IN_DAYS = 1;` to reduce retention
+            """)
+        else:
+            st.info("No time travel storage data available.")
+            
+    except Exception as e:
+        st.error(f"Error fetching time travel storage data: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Query 7: Use of Iceberg Tables (Gen2)
+    st.subheader("7. Iceberg Tables (Gen2) Usage")
+    
+    query_iceberg_tables = """
+    SELECT 
+        table_catalog as database_name,
+        table_schema as schema_name,
+        table_name,
+        table_type,
+        is_iceberg,
+        created,
+        last_altered,
+        row_count,
+        bytes / POWER(1024, 3) as storage_gb,
+        comment
+    FROM snowflake.account_usage.tables
+    WHERE deleted IS NULL
+        AND is_iceberg = 'YES'
+    ORDER BY last_altered DESC
+    """
+    
+    try:
+        df_iceberg = execute_query(query_iceberg_tables)
+        
+        # Also get total table count for comparison
+        query_total_tables = """
+        SELECT 
+            COUNT(*) as total_tables,
+            SUM(CASE WHEN is_iceberg = 'YES' THEN 1 ELSE 0 END) as iceberg_tables,
+            SUM(bytes) / POWER(1024, 3) as total_storage_gb,
+            SUM(CASE WHEN is_iceberg = 'YES' THEN bytes ELSE 0 END) / POWER(1024, 3) as iceberg_storage_gb
+        FROM snowflake.account_usage.tables
+        WHERE deleted IS NULL
+        """
+        
+        df_summary = execute_query(query_total_tables)
+        
+        if not df_summary.empty:
+            total_tables = df_summary['TOTAL_TABLES'].iloc[0]
+            iceberg_tables = df_summary['ICEBERG_TABLES'].iloc[0]
+            total_storage = df_summary['TOTAL_STORAGE_GB'].iloc[0]
+            iceberg_storage = df_summary['ICEBERG_STORAGE_GB'].iloc[0]
+            
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Total Tables", f"{total_tables:,}")
+            with col2:
+                st.metric("Iceberg Tables", f"{iceberg_tables:,}")
+            with col3:
+                iceberg_pct = (iceberg_tables / total_tables * 100) if total_tables > 0 else 0
+                st.metric("Iceberg Adoption", f"{iceberg_pct:.1f}%")
+            with col4:
+                st.metric("Iceberg Storage", f"{iceberg_storage:.2f} GB")
+            
+            if not df_iceberg.empty:
+                # Iceberg tables by database
+                iceberg_by_db = df_iceberg.groupby('DATABASE_NAME').agg({
+                    'TABLE_NAME': 'count',
+                    'STORAGE_GB': 'sum'
+                }).reset_index()
+                iceberg_by_db.columns = ['DATABASE_NAME', 'TABLE_COUNT', 'TOTAL_STORAGE_GB']
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    fig_db = px.bar(
+                        iceberg_by_db,
+                        x='DATABASE_NAME',
+                        y='TABLE_COUNT',
+                        title='Iceberg Tables by Database',
+                        labels={'TABLE_COUNT': 'Number of Tables', 'DATABASE_NAME': 'Database'},
+                        color='TABLE_COUNT',
+                        color_continuous_scale='Blues'
+                    )
+                    st.plotly_chart(fig_db, use_container_width=True)
+                
+                with col2:
+                    fig_storage = px.bar(
+                        iceberg_by_db,
+                        x='DATABASE_NAME',
+                        y='TOTAL_STORAGE_GB',
+                        title='Iceberg Storage by Database',
+                        labels={'TOTAL_STORAGE_GB': 'Storage (GB)', 'DATABASE_NAME': 'Database'},
+                        color='TOTAL_STORAGE_GB',
+                        color_continuous_scale='Greens'
+                    )
+                    st.plotly_chart(fig_storage, use_container_width=True)
+                
+                # Detailed table list
+                st.markdown("**Iceberg Tables Details:**")
+                st.dataframe(
+                    df_iceberg,
+                    column_config={
+                        "DATABASE_NAME": "Database",
+                        "SCHEMA_NAME": "Schema",
+                        "TABLE_NAME": "Table",
+                        "TABLE_TYPE": "Type",
+                        "IS_ICEBERG": "Iceberg",
+                        "CREATED": st.column_config.DatetimeColumn("Created", format="YYYY-MM-DD HH:mm"),
+                        "LAST_ALTERED": st.column_config.DatetimeColumn("Last Altered", format="YYYY-MM-DD HH:mm"),
+                        "ROW_COUNT": st.column_config.NumberColumn("Rows", format="%d"),
+                        "STORAGE_GB": st.column_config.NumberColumn("Storage (GB)", format="%.2f"),
+                        "COMMENT": "Comment"
+                    },
+                    hide_index=True,
+                    use_container_width=True
+                )
+                
+                st.success(f"✅ Found {len(df_iceberg)} Iceberg table(s) in your account")
+                
+                st.info("""
+                💡 **Iceberg Tables (Gen2) Benefits**:
+                - **Better Performance**: Optimized for large-scale analytics with improved query performance
+                - **Open Format**: Apache Iceberg is an open table format, enabling interoperability with other platforms
+                - **ACID Transactions**: Full transactional support with schema evolution
+                - **Time Travel**: Enhanced time travel capabilities with snapshot isolation
+                - **Partitioning**: Automatic partition pruning and hidden partitioning
+                - **Metadata Management**: Efficient metadata operations for large tables
+                
+                **When to Use Iceberg Tables**:
+                - Large tables (>1TB) with frequent updates
+                - Tables requiring complex partitioning strategies
+                - Multi-cloud or hybrid cloud architectures
+                - Need for interoperability with external compute engines (Spark, Flink, etc.)
+                """)
+            else:
+                st.info("""
+                ℹ️ **No Iceberg tables found in your account.**
+                
+                Consider using Iceberg tables for:
+                - Large analytical tables (>1TB)
+                - Tables with frequent updates and deletes
+                - Cross-platform data sharing requirements
+                
+                To create an Iceberg table:
+                ```sql
+                CREATE ICEBERG TABLE my_table (
+                    id INT,
+                    name STRING,
+                    created_date DATE
+                )
+                CATALOG = 'SNOWFLAKE'
+                EXTERNAL_VOLUME = 'my_external_volume'
+                BASE_LOCATION = 'my_iceberg_table';
+                ```
+                """)
+        else:
+            st.info("Unable to fetch table statistics.")
+            
+    except Exception as e:
+        st.error(f"Error fetching Iceberg table data: {str(e)}")
 
 # Footer
 st.markdown("---")
@@ -284,7 +2059,6 @@ st.markdown("""
 <div style='text-align: center; color: #666;'>
     <p>Built with ❄️ Streamlit | Based on Snowflake Well-Architected Framework</p>
     <p><a href="https://www.snowflake.com/en/developers/guides/well-architected-framework/">Learn more about Snowflake Well-Architected Framework</a></p>
-    <p><strong>Running in LOCAL mode</strong> - For full app functionality, deploy to Snowflake Streamlit</p>
+    <p><strong>Running in LOCAL mode with OAuth Token Authentication</strong></p>
 </div>
 """, unsafe_allow_html=True)
-
