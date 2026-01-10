@@ -1215,9 +1215,9 @@ with tab2:
         SELECT 
             pipe_name,
             COUNT(*) as load_events,
-            SUM(files_inserted) as total_files_loaded,
-            SUM(rows_inserted) as total_rows_loaded,
+            SUM(TO_NUMBER(files_inserted)) as total_files_loaded,
             SUM(bytes_inserted) / POWER(1024, 3) as total_gb_loaded,
+            SUM(bytes_billed) / POWER(1024, 3) as total_gb_billed,
             SUM(credits_used) as total_credits_used,
             MAX(end_time) as last_load_time,
             DATEDIFF(hour, MAX(end_time), CURRENT_TIMESTAMP()) as hours_since_last_load
@@ -1256,17 +1256,17 @@ with tab2:
                 
                 # Summary metrics
                 total_files = df_pipe_usage['TOTAL_FILES_LOADED'].sum()
-                total_rows = df_pipe_usage['TOTAL_ROWS_LOADED'].sum()
                 total_gb = df_pipe_usage['TOTAL_GB_LOADED'].sum()
+                total_gb_billed = df_pipe_usage['TOTAL_GB_BILLED'].sum()
                 total_credits = df_pipe_usage['TOTAL_CREDITS_USED'].sum()
                 
                 col1, col2, col3, col4 = st.columns(4)
                 with col1:
                     st.metric("Total Files Loaded", f"{total_files:,.0f}")
                 with col2:
-                    st.metric("Total Rows Loaded", f"{total_rows:,.0f}")
-                with col3:
                     st.metric("Total GB Loaded", f"{total_gb:.2f}")
+                with col3:
+                    st.metric("Total GB Billed", f"{total_gb_billed:.2f}")
                 with col4:
                     st.metric("Total Credits", f"{total_credits:.2f}")
                 
