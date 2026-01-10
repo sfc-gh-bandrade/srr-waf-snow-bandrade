@@ -1329,7 +1329,7 @@ with tab2:
     
     try:
         df_task_history = session.sql(query_task_history).to_pandas()
-        
+        test
         if not df_task_history.empty:
             # Calculate success/failure metrics
             state_counts = df_task_history['STATE'].value_counts()
