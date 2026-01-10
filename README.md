@@ -60,36 +60,82 @@ This application provides actionable insights across the five pillars of the Wel
 
 - Snowflake account with appropriate permissions
 - Access to `SNOWFLAKE.ACCOUNT_USAGE` schema (requires `ACCOUNTADMIN` or granted privileges)
-- Snowflake Streamlit environment or local Snowflake connection
+- Snowflake Streamlit creation permission 
 
 ## Installation
 
 ### Option 1: Deploy to Snowflake (Recommended)
 
-1. **Create a Streamlit app in Snowflake:**
+1. **Create databases, schemas and compute pool to host streamlit app:**
 
 ```sql
 USE ROLE ACCOUNTADMIN;
-USE DATABASE <YOUR_DATABASE>;
-USE SCHEMA <YOUR_SCHEMA>;
+-- 
+CREATE DATABASE IF NOT EXISTS WAF_METRICS_DB;
 
-CREATE STREAMLIT snowflake_waf_review
-  ROOT_LOCATION = '@<YOUR_STAGE>'
-  MAIN_FILE = 'app.py'
-  QUERY_WAREHOUSE = <YOUR_WAREHOUSE>;
+CREATE SCHEMA IF NOT EXISTS WAF_METRICS_DB.WAF_METRICS_SCHEMA;
+
+USE DATABASE WAF_METRICS_DB;
+
+USE SCHEMA WAF_METRICS_SCHEMA;
+
+-- If you are using warehouse to host app, you don't need a pool. However, hosting apps on computer pool is cheaper and recommended
+CREATE COMPUTE POOL IF NOT EXISTS WAF_METRICS_COMPUTE_POOL
+  MIN_NODES = 1
+  MAX_NODES = 2
+  INSTANCE_FAMILY = CPU_X64_XS
+  AUTO_RESUME = TRUE
+  INITIALLY_SUSPENDED = TRUE
+  AUTO_SUSPEND_SECS = 600
+  COMMENT = 'X-Small compute pool for WAF Streamlit APP';
 ```
 
-2. **Upload the files:**
+2. **Create External Access Integration (Optional if using Hosted Warehouse ):**
 
 ```sql
-PUT file:///path/to/app.py @<YOUR_STAGE>/app.py AUTO_COMPRESS=FALSE OVERWRITE=TRUE;
+-- Required for downloading packages
+CREATE OR REPLACE NETWORK RULE pypi_api_rule
+  MODE = EGRESS
+  TYPE = HOST_PORT
+  VALUE_LIST = ('pypi.org','*.pythonhosted.org');
+
+CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION pypi_external_access_int
+  ALLOWED_NETWORK_RULES = (pypi_api_rule)
+  ENABLED = TRUE;  
 ```
 
-3. **Grant necessary privileges:**
+3. **Create GIT INTEGRATION, GIT REPOSITORY object and fetch data:**
 
 ```sql
 -- Grant access to ACCOUNT_USAGE
-GRANT IMPORTED PRIVILEGES ON DATABASE SNOWFLAKE TO ROLE <YOUR_ROLE>;
+CREATE OR REPLACE API INTEGRATION GIT_API_REPO_WAF
+  API_PROVIDER = git_https_api
+  API_ALLOWED_PREFIXES = ('https://github.com/sfc-gh-bandrade/')
+  ENABLED = TRUE;
+
+-- 2. Create the Git Repository Object
+CREATE OR REPLACE GIT REPOSITORY WAF_repo
+  API_INTEGRATION = GIT_API_REPO_WAF
+  ORIGIN = 'https://github.com/sfc-gh-bandrade/srr-waf-snow-bandrade.git';
+
+-- 3. Fetch the metadata/files
+ALTER GIT REPOSITORY WAF_repo FETCH;
+```
+
+4. **Create Streamlit APP using previously created objects:**
+
+```sql
+
+CREATE STREAMLIT IF NOT EXISTS WAF_SNOWFLAKE
+  FROM @WAF_METRICS_DB.WAF_METRICS_SCHEMA.WAF_repo/branches/main
+  MAIN_FILE = 'app.py'
+  QUERY_WAREHOUSE = COMPUTE_WH
+  RUNTIME_NAME = 'SYSTEM$ST_CONTAINER_RUNTIME_PY3_11'
+  COMPUTE_POOL = WAF_METRICS_COMPUTE_POOL
+  EXTERNAL_ACCESS_INTEGRATIONS = (pypi_external_access_int)
+  COMMENT = 'WAF Streamlit APP'
+  TITLE = 'Well Architected Framework Analyzer';
+
 ```
 
 ### Option 2: Run Locally
