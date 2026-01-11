@@ -138,40 +138,6 @@ CREATE STREAMLIT IF NOT EXISTS WAF_SNOWFLAKE
 
 ```
 
-### Option 2: Run Locally
-
-1. **Clone the repository:**
-
-```bash
-git clone <your-repo-url>
-cd snowflake-readiness-review
-```
-
-2. **Install dependencies:**
-
-```bash
-pip install -r requirements.txt
-```
-
-3. **Configure Snowflake connection:**
-
-Create a `.streamlit/secrets.toml` file:
-
-```toml
-[connections.snowflake]
-account = "your_account"
-user = "your_username"
-password = "your_password"
-role = "ACCOUNTADMIN"
-warehouse = "your_warehouse"
-```
-
-4. **Run the application:**
-
-```bash
-streamlit run app.py
-```
-
 ## Required Permissions
 
 The application requires access to the following Snowflake views:
@@ -264,6 +230,10 @@ Contributions are welcome! Please feel free to submit issues or pull requests.
 ## License
 
 This project is licensed under the MIT License.
+
+## Changelog
+
+For the latest updates and changes to the application, see [CHANGELOG.md](CHANGELOG.md).
 
 ## Support
 

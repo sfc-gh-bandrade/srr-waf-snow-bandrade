@@ -1277,8 +1277,8 @@ with tab2:
                         "PIPE_NAME": "Pipe Name",
                         "LOAD_EVENTS": "Load Events",
                         "TOTAL_FILES_LOADED": st.column_config.NumberColumn("Files Loaded", format="%d"),
-                        "TOTAL_ROWS_LOADED": st.column_config.NumberColumn("Rows Loaded", format="%d"),
                         "TOTAL_GB_LOADED": st.column_config.NumberColumn("GB Loaded", format="%.2f"),
+                        "TOTAL_GB_BILLED": st.column_config.NumberColumn("GB Billed", format="%.2f"),
                         "TOTAL_CREDITS_USED": st.column_config.NumberColumn("Credits Used", format="%.4f"),
                         "LAST_LOAD_TIME": "Last Load",
                         "HOURS_SINCE_LAST_LOAD": st.column_config.NumberColumn("Hours Since Last", format="%d")
