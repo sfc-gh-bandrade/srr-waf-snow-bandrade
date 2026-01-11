@@ -167,6 +167,7 @@ with tab1:
         WHERE start_time >= DATEADD(day, -{days_back}, CURRENT_TIMESTAMP())
             AND execution_status = 'SUCCESS'
             AND query_type IN ('SELECT', 'INSERT', 'UPDATE', 'DELETE', 'MERGE')
+            AND user_name NOT IN ('SYSTEM', 'dataplane_service', 'dataplatform_admin')
     )
     SELECT 
         query_date,
@@ -1078,23 +1079,23 @@ with tab2:
 
     st.markdown("---")
     
-    # Query 3: Data Pipeline Reliability (Snowpipe)
-    st.subheader("3. Data Pipeline Reliability (Snowpipe)")
+    # Query 3: Task Execution Reliability
+    st.subheader("3. Task Execution Reliability")
     
-    query_pipes = """
+    query_task_history = f"""
     SELECT 
-        pipe_catalog,
-        pipe_schema,
-        pipe_name,
-        pipe_owner,
-        is_autoingest_enabled,
-        created,
-        last_altered,
-        DATEDIFF(day, last_altered, CURRENT_TIMESTAMP()) as days_since_modified,
-        DATEDIFF(day, created, CURRENT_TIMESTAMP()) as pipe_age_days
-    FROM snowflake.account_usage.pipes
-    WHERE deleted IS NULL
-    ORDER BY pipe_catalog, pipe_schema, pipe_name
+        name,
+        database_name,
+        schema_name,
+        state,
+        schedule,
+        error_integration,
+        created_on,
+        DATEDIFF(day, created_on, CURRENT_TIMESTAMP()) as task_age_days
+    FROM snowflake.account_usage.tasks
+    WHERE deleted_on IS NULL
+        AND database_name NOT IN ('SNOWFLAKE', 'SECURITY_NETWORK_DB')
+    ORDER BY database_name, schema_name, name
     """
     
     try:
@@ -1265,6 +1266,7 @@ with tab2:
         DATEDIFF(day, created_on, CURRENT_TIMESTAMP()) as task_age_days
     FROM snowflake.account_usage.tasks
     WHERE deleted_on IS NULL
+        AND database_name NOT IN ('SNOWFLAKE', 'SECURITY_NETWORK_DB')
     ORDER BY database_name, schema_name, name
     """
     
@@ -1336,6 +1338,7 @@ with tab2:
                 AVG(scheduled_time_lag_seconds) as avg_lag_seconds
             FROM snowflake.account_usage.task_history
             WHERE scheduled_time >= DATEADD(day, -{days_back}, CURRENT_TIMESTAMP())
+                AND database_name NOT IN ('SNOWFLAKE', 'SECURITY_NETWORK_DB')
             GROUP BY name, database_name, schema_name, state
             ORDER BY failure_count DESC
             LIMIT 20
@@ -1389,6 +1392,104 @@ with tab2:
             
     except Exception as e:
         st.error(f"Error fetching task data: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Query 5: Event Table Monitoring
+    st.subheader("5. Event Table Monitoring")
+    
+    st.markdown("""
+    **Event Tables** provide a centralized way to monitor and trace events across your Snowflake account, 
+    including errors, warnings, and audit logs from various services like tasks, UDFs, and stored procedures.
+    """)
+    
+    try:
+        # Check for event tables
+        query_event_tables = "SHOW EVENT TABLES IN ACCOUNT"
+        
+        df_event_tables = execute_query(query_event_tables)
+        
+        # Filter out Snowflake-owned event tables
+        if not df_event_tables.empty:
+            # Column names might be uppercase
+            owner_col = None
+            for col in df_event_tables.columns:
+                if col.upper() == 'OWNER':
+                    owner_col = col
+                    break
+            
+            if owner_col:
+                df_event_tables = df_event_tables[df_event_tables[owner_col] != 'SNOWFLAKE']
+        
+        if not df_event_tables.empty:
+            st.success(f"✅ Your account has {len(df_event_tables)} event table(s) configured for centralized monitoring!")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Event Tables", f"{len(df_event_tables):,.0f}")
+            with col2:
+                st.metric("Objects Monitored", "N/A")
+            
+            st.markdown("**Configured Event Tables:**")
+            st.dataframe(
+                df_event_tables,
+                hide_index=True,
+                use_container_width=True
+            )
+            
+            st.info("""
+            💡 **Benefits of Event Tables:**
+            - Centralized error tracking and diagnostics
+            - Enhanced observability for tasks, UDFs, and stored procedures
+            - Integration with external monitoring tools
+            - Long-term audit and compliance logs
+            
+            [Learn more about Event Tables](https://docs.snowflake.com/en/developer-guide/logging-tracing/event-table-setting-up)
+            """)
+        else:
+            st.markdown('<div class="warning-card">', unsafe_allow_html=True)
+            st.warning("⚠️ **No event tables configured**. Event tables provide centralized monitoring and error tracking for your Snowflake objects.")
+            st.markdown('</div>', unsafe_allow_html=True)
+            
+            st.markdown("""
+            **Why use Event Tables?**
+            
+            Event tables help you:
+            - 🔍 **Track errors**: Centralize error logs from tasks, UDFs, and stored procedures
+            - 📊 **Monitor performance**: Analyze execution patterns and identify bottlenecks
+            - 🛡️ **Ensure compliance**: Maintain audit trails for regulatory requirements
+            - 🔔 **Set up alerts**: Trigger notifications based on specific events
+            
+            **How to create an Event Table:**
+            """)
+            
+            st.code("""
+-- Step 1: Create an event table
+CREATE EVENT TABLE my_events_db.my_events_schema.my_event_table;
+
+-- Step 2: Set it as the account-level event table
+ALTER ACCOUNT SET EVENT_TABLE = my_events_db.my_events_schema.my_event_table;
+
+-- Step 3: Enable event logging on objects (example for tasks)
+CREATE TASK my_task
+  WAREHOUSE = my_warehouse
+  SCHEDULE = '5 MINUTE'
+AS
+  CALL my_procedure();
+
+-- Event logging is automatically enabled for tasks when an account event table is set
+
+-- Step 4: Query events
+SELECT *
+FROM my_events_db.my_events_schema.my_event_table
+WHERE timestamp >= DATEADD(hour, -24, CURRENT_TIMESTAMP())
+ORDER BY timestamp DESC;
+            """, language="sql")
+            
+            st.info("📚 **Learn more**: [Event Tables Documentation](https://docs.snowflake.com/en/developer-guide/logging-tracing/event-table-setting-up)")
+            
+    except Exception as e:
+        st.warning(f"Unable to fetch event table information: {str(e)}")
 
 # ============================================================================
 # TAB 3: OPERATIONAL EXCELLENCE
@@ -1832,6 +1933,7 @@ with tab3:
         COUNT(DISTINCT warehouse_name) as warehouses_used
     FROM snowflake.account_usage.query_history
     WHERE start_time >= DATEADD(day, -{days_back}, CURRENT_TIMESTAMP())
+        AND user_name NOT IN ('SYSTEM', 'dataplane_service')
     GROUP BY user_name, query_type
     ORDER BY query_count DESC
     LIMIT 30
@@ -1866,6 +1968,280 @@ with tab3:
             
     except Exception as e:
         st.error(f"Error fetching query patterns: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Query 5: Data Metric Functions (DMF)
+    st.subheader("5. Data Metric Functions Usage")
+    
+    try:
+        query_dmf = """
+        SELECT 
+            metric_database_name,
+            metric_schema_name,
+            metric_name,
+            ref_database_name,
+            ref_schema_name,
+            ref_entity_name,
+            schedule,
+            schedule_status
+        FROM snowflake.account_usage.data_metric_function_references
+        WHERE schedule_status NOT LIKE 'SUSPENDED%'
+        ORDER BY ref_entity_name
+        """
+        
+        df_dmf = execute_query(query_dmf)
+        
+        if not df_dmf.empty:
+            total_dmf = len(df_dmf)
+            unique_tables = df_dmf[['REF_DATABASE_NAME', 'REF_SCHEMA_NAME', 'REF_ENTITY_NAME']].drop_duplicates()
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Active DMF References", f"{total_dmf:,.0f}")
+            with col2:
+                st.metric("Tables/Views Monitored", f"{len(unique_tables):,.0f}")
+            
+            st.success("✅ Your organization is using Data Metric Functions for data quality monitoring!")
+            
+            st.dataframe(
+                df_dmf,
+                column_config={
+                    "METRIC_DATABASE_NAME": "DMF Database",
+                    "METRIC_SCHEMA_NAME": "DMF Schema",
+                    "METRIC_NAME": "Metric Name",
+                    "REF_DATABASE_NAME": "Monitored Database",
+                    "REF_SCHEMA_NAME": "Monitored Schema",
+                    "REF_ENTITY_NAME": "Monitored Object",
+                    "SCHEDULE": "Schedule",
+                    "SCHEDULE_STATUS": "Status"
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+            
+            st.info("💡 **Tip**: Data Metric Functions help monitor data quality in real-time. [Learn more](https://docs.snowflake.com/en/user-guide/data-quality-intro)")
+        else:
+            st.markdown('<div class="warning-card">', unsafe_allow_html=True)
+            st.warning("⚠️ **No Data Metric Functions detected**. DMFs help monitor data quality and detect anomalies in your tables.")
+            st.markdown('</div>', unsafe_allow_html=True)
+            st.code("""
+-- Example: Create a DMF to monitor null values
+CREATE OR REPLACE DATA METRIC FUNCTION check_nulls_dmf(
+    arg_t TABLE(arg_col NUMBER)
+)
+RETURNS NUMBER
+AS 
+$$
+SELECT COUNT(*) FROM arg_t WHERE arg_col IS NULL
+$$;
+
+-- Attach to a table
+ALTER TABLE my_table
+    SET DATA_METRIC SCHEDULE = '1 HOUR'
+    DATA METRIC FUNCTION check_nulls_dmf ON (my_column);
+            """, language="sql")
+            
+    except Exception as e:
+        st.warning(f"Unable to fetch Data Metric Functions: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Query 6: Alert Usages
+    st.subheader("6. Alert Configuration & History")
+    
+    try:
+        # Get alerts using SHOW ALERTS
+        query_alerts = "SHOW ALERTS"
+        
+        df_alerts = execute_query(query_alerts)
+        
+        if not df_alerts.empty:
+            total_alerts = len(df_alerts)
+            # Check for 'state' column (could be uppercase or lowercase)
+            state_col = None
+            for col in df_alerts.columns:
+                if col.upper() == 'STATE':
+                    state_col = col
+                    break
+            
+            if state_col:
+                started_alerts = len(df_alerts[df_alerts[state_col] == 'started'])
+                suspended_alerts = len(df_alerts[df_alerts[state_col] == 'suspended'])
+            else:
+                started_alerts = 0
+                suspended_alerts = 0
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Alerts", f"{total_alerts:,.0f}")
+            with col2:
+                st.metric("Active Alerts", f"{started_alerts:,.0f}", 
+                         delta="✅" if started_alerts > 0 else None)
+            with col3:
+                st.metric("Suspended Alerts", f"{suspended_alerts:,.0f}")
+            
+            st.success(f"✅ Your account has {total_alerts} alert(s) configured for proactive monitoring!")
+            
+            # Display alerts
+            st.markdown("**Configured Alerts:**")
+            st.dataframe(
+                df_alerts,
+                hide_index=True,
+                use_container_width=True
+            )
+            
+            # Get alert history
+            st.markdown("---")
+            st.markdown("**Recent Alert Execution History:**")
+            
+            query_alert_history = f"""
+            SELECT 
+                alert_name,
+                alert_id,
+                database_name,
+                schema_name,
+                scheduled_time,
+                completed_time,
+                state,
+                condition_query_text,
+                action_query_text,
+                error_message
+            FROM snowflake.account_usage.alert_history
+            WHERE scheduled_time >= DATEADD(day, -{days_back}, CURRENT_TIMESTAMP())
+            ORDER BY scheduled_time DESC
+            LIMIT 50
+            """
+            
+            df_alert_history = execute_query(query_alert_history)
+            
+            if not df_alert_history.empty:
+                # Count successful vs failed
+                success_count = len(df_alert_history[df_alert_history['STATE'] == 'SUCCEEDED'])
+                failed_count = len(df_alert_history[df_alert_history['STATE'].isin(['FAILED', 'SKIPPED'])])
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Successful Executions", f"{success_count:,.0f}")
+                with col2:
+                    st.metric("Failed/Skipped", f"{failed_count:,.0f}", 
+                             delta="⚠️" if failed_count > 0 else None)
+                
+                st.dataframe(
+                    df_alert_history,
+                    column_config={
+                        "ALERT_NAME": "Alert Name",
+                        "DATABASE_NAME": "Database",
+                        "SCHEMA_NAME": "Schema",
+                        "SCHEDULED_TIME": "Scheduled Time",
+                        "COMPLETED_TIME": "Completed Time",
+                        "STATE": "State",
+                        "ERROR_MESSAGE": st.column_config.TextColumn("Error Message", width="medium")
+                    },
+                    hide_index=True,
+                    use_container_width=True
+                )
+                
+                if failed_count > 0:
+                    st.markdown('<div class="warning-card">', unsafe_allow_html=True)
+                    st.warning(f"⚠️ **{failed_count} alert execution(s) failed or were skipped**. Review error messages and alert conditions.")
+                    st.markdown('</div>', unsafe_allow_html=True)
+            else:
+                st.info("ℹ️ No alert execution history found in the selected period.")
+            
+            st.info("💡 **Tip**: Alerts help you proactively monitor data quality, pipeline health, and system performance. [Learn more](https://docs.snowflake.com/en/user-guide/alerts)")
+        else:
+            st.markdown('<div class="warning-card">', unsafe_allow_html=True)
+            st.warning("⚠️ **No alerts configured**. Alerts help you proactively detect and respond to issues in your data pipelines.")
+            st.markdown('</div>', unsafe_allow_html=True)
+            st.code("""
+-- Example: Create an alert for failed tasks
+CREATE OR REPLACE ALERT task_failure_alert
+  WAREHOUSE = my_warehouse
+  SCHEDULE = '5 MINUTE'
+  IF (EXISTS (
+    SELECT 1
+    FROM snowflake.account_usage.task_history
+    WHERE state = 'FAILED'
+      AND completed_time >= DATEADD(minute, -5, CURRENT_TIMESTAMP())
+  ))
+  THEN
+    -- Define action (e.g., call stored procedure, send notification)
+    CALL notify_on_task_failure();
+
+-- Start the alert
+ALTER ALERT task_failure_alert RESUME;
+            """, language="sql")
+            
+    except Exception as e:
+        st.warning(f"Unable to fetch alert data: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Query 7: Account Timezone
+    st.subheader("7. Account Timezone Configuration")
+    
+    try:
+        query_timezone = """
+        SELECT CURRENT_ACCOUNT() as account_name,
+               CURRENT_TIMESTAMP() as current_timestamp,
+               CONVERT_TIMEZONE('UTC', CURRENT_TIMESTAMP()) as utc_timestamp
+        """
+        
+        # Get timezone parameter
+        query_tz_param = "SHOW PARAMETERS LIKE 'TIMEZONE' IN ACCOUNT"
+        
+        df_tz_info = execute_query(query_timezone)
+        df_tz_param = execute_query(query_tz_param)
+        
+        if not df_tz_param.empty:
+            # Find the value column - could be 'value', 'VALUE', or quoted '"value"'
+            value_col = None
+            for col in df_tz_param.columns:
+                if col.upper() == 'VALUE' or col.strip('"').upper() == 'VALUE':
+                    value_col = col
+                    break
+            
+            if value_col is None:
+                raise ValueError(f"VALUE column not found. Available columns: {list(df_tz_param.columns)}")
+            
+            timezone = df_tz_param.iloc[0][value_col]
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Account Timezone", timezone)
+            with col2:
+                if not df_tz_info.empty:
+                    current_ts = df_tz_info.iloc[0]['CURRENT_TIMESTAMP']
+                    st.metric("Current Account Time", current_ts.strftime('%Y-%m-%d %H:%M:%S %Z') if hasattr(current_ts, 'strftime') else str(current_ts))
+            
+            st.info(f"""
+            ℹ️ **Current Configuration**: Your account timezone is set to **{timezone}**.
+            
+            All timestamp operations (e.g., CURRENT_TIMESTAMP(), task schedules, query history) use this timezone.
+            """)
+            
+            st.markdown("**How to change timezone:**")
+            st.code("""
+-- Change account timezone (requires ACCOUNTADMIN role)
+ALTER ACCOUNT SET TIMEZONE = 'America/New_York';
+
+-- View available timezones
+SELECT * FROM TABLE(INFORMATION_SCHEMA.TIMEZONES());
+
+-- Common timezones:
+-- 'America/New_York' (EST/EDT)
+-- 'America/Los_Angeles' (PST/PDT)
+-- 'America/Chicago' (CST/CDT)
+-- 'Europe/London' (GMT/BST)
+-- 'Asia/Tokyo' (JST)
+-- 'UTC' (Coordinated Universal Time)
+            """, language="sql")
+            
+            st.warning("⚠️ **Important**: Changing the timezone affects all timestamp operations account-wide. Coordinate with your team before making changes.")
+        
+    except Exception as e:
+        st.warning(f"Unable to fetch timezone configuration: {str(e)}")
 
 # ============================================================================
 # TAB 4: SECURITY & GOVERNANCE
@@ -1879,53 +2255,120 @@ with tab4:
     # Query 1: MFA Adoption
     st.subheader("1. Multi-Factor Authentication (MFA)")
     
-    query_mfa = """
-    SELECT 
-        CASE 
-            WHEN ext_authn_duo = TRUE THEN 'MFA Enabled'
-            ELSE 'MFA Not Enabled'
-        END as mfa_status,
-        COUNT(*) as user_count
-    FROM snowflake.account_usage.users
-    WHERE deleted_on IS NULL
-        AND disabled = FALSE
-    GROUP BY mfa_status
-    """
+    # SSO Toggle
+    uses_sso = st.checkbox(
+        "🔐 Organization Uses SSO (Single Sign-On)",
+        value=False,
+        help="Enable if your organization uses SSO for authentication. This will show users created outside of SSO."
+    )
     
-    try:
-        df_mfa = execute_query(query_mfa)
+    if uses_sso:
+        # Show users NOT using SSO
+        query_non_sso_users = """
+        SELECT 
+            name as user_name,
+            login_name,
+            email,
+            created_on,
+            last_success_login,
+            disabled,
+            ext_authn_duo as has_mfa,
+            default_role
+        FROM snowflake.account_usage.users
+        WHERE deleted_on IS NULL
+            AND disabled = FALSE
+            AND (ext_authn_uid IS NULL OR ext_authn_uid = '')
+            AND login_name NOT LIKE '%SF$SERVICE%'
+        ORDER BY created_on DESC
+        """
         
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            fig_mfa = px.pie(
-                df_mfa,
-                values='USER_COUNT',
-                names='MFA_STATUS',
-                title='MFA Adoption Rate',
-                color='MFA_STATUS',
-                color_discrete_map={'MFA Enabled': '#28a745', 'MFA Not Enabled': '#dc3545'}
-            )
-            st.plotly_chart(fig_mfa, use_container_width=True)
-        
-        with col2:
-            total_users = df_mfa['USER_COUNT'].sum()
-            mfa_enabled = df_mfa[df_mfa['MFA_STATUS'] == 'MFA Enabled']['USER_COUNT'].sum() if 'MFA Enabled' in df_mfa['MFA_STATUS'].values else 0
-            mfa_rate = (mfa_enabled / total_users * 100) if total_users > 0 else 0
+        try:
+            df_non_sso = execute_query(query_non_sso_users)
             
-            st.metric("Total Active Users", total_users)
-            st.metric("MFA Enabled", mfa_enabled)
-            st.metric("MFA Adoption Rate", f"{mfa_rate:.1f}%")
+            if not df_non_sso.empty:
+                st.markdown('<div class="warning-card">', unsafe_allow_html=True)
+                st.warning(f"⚠️ **{len(df_non_sso)} user(s) created outside SSO**. These users bypass SSO authentication and may pose a security risk.")
+                st.markdown('</div>', unsafe_allow_html=True)
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Non-SSO Users", len(df_non_sso))
+                with col2:
+                    non_sso_with_mfa = len(df_non_sso[df_non_sso['HAS_MFA'] == True])
+                    st.metric("Non-SSO Users with MFA", non_sso_with_mfa)
+                
+                st.markdown("**Non-SSO Users Detail:**")
+                st.dataframe(
+                    df_non_sso,
+                    column_config={
+                        "USER_NAME": "User Name",
+                        "LOGIN_NAME": "Login Name",
+                        "EMAIL": "Email",
+                        "CREATED_ON": "Created On",
+                        "LAST_SUCCESS_LOGIN": "Last Login",
+                        "HAS_MFA": "MFA Enabled",
+                        "DEFAULT_ROLE": "Default Role"
+                    },
+                    hide_index=True,
+                    use_container_width=True
+                )
+                
+                st.info("💡 **Recommendation**: For SSO-enabled organizations, disable or migrate non-SSO users to SSO authentication. Ensure all non-SSO users have MFA enabled as a minimum.")
+            else:
+                st.success("✅ All users are configured to use SSO authentication.")
+                
+        except Exception as e:
+            st.error(f"Error fetching non-SSO user data: {str(e)}")
+    else:
+        # Show MFA adoption
+        query_mfa = """
+        SELECT 
+            CASE 
+                WHEN ext_authn_duo = TRUE THEN 'MFA Enabled'
+                ELSE 'MFA Not Enabled'
+            END as mfa_status,
+            COUNT(*) as user_count
+        FROM snowflake.account_usage.users
+        WHERE deleted_on IS NULL
+            AND disabled = FALSE
+            AND login_name NOT LIKE '%SF$SERVICE%'
+        GROUP BY mfa_status
+        """
         
-        if mfa_rate < 100:
-            st.markdown('<div class="danger-card">', unsafe_allow_html=True)
-            st.error(f"⚠️ **Critical**: Only {mfa_rate:.1f}% of users have MFA enabled. Require MFA for all users to enhance security.")
-            st.markdown('</div>', unsafe_allow_html=True)
-        else:
-            st.success("✅ All active users have MFA enabled.")
+        try:
+            df_mfa = execute_query(query_mfa)
             
-    except Exception as e:
-        st.error(f"Error fetching MFA data: {str(e)}")
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                fig_mfa = px.pie(
+                    df_mfa,
+                    values='USER_COUNT',
+                    names='MFA_STATUS',
+                    title='MFA Adoption Rate',
+                    color='MFA_STATUS',
+                    color_discrete_map={'MFA Enabled': '#28a745', 'MFA Not Enabled': '#dc3545'}
+                )
+                st.plotly_chart(fig_mfa, use_container_width=True)
+            
+            with col2:
+                total_users = df_mfa['USER_COUNT'].sum()
+                mfa_enabled = df_mfa[df_mfa['MFA_STATUS'] == 'MFA Enabled']['USER_COUNT'].sum() if 'MFA Enabled' in df_mfa['MFA_STATUS'].values else 0
+                mfa_rate = (mfa_enabled / total_users * 100) if total_users > 0 else 0
+                
+                st.metric("Total Active Users", total_users)
+                st.metric("MFA Enabled", mfa_enabled)
+                st.metric("MFA Adoption Rate", f"{mfa_rate:.1f}%")
+            
+            if mfa_rate < 100:
+                st.markdown('<div class="danger-card">', unsafe_allow_html=True)
+                st.error(f"⚠️ **Critical**: Only {mfa_rate:.1f}% of users have MFA enabled. Require MFA for all users to enhance security.")
+                st.markdown('</div>', unsafe_allow_html=True)
+            else:
+                st.success("✅ All active users have MFA enabled.")
+                
+        except Exception as e:
+            st.error(f"Error fetching MFA data: {str(e)}")
     
     st.markdown("---")
     
@@ -2127,8 +2570,60 @@ with tab4:
     
     st.markdown("---")
     
-    # Query 5: Failed Login Attempts
-    st.subheader("5. Failed Authentication Attempts")
+    # Query 5: Notification Contacts
+    st.subheader("5. Notification Contacts Configuration")
+    
+    try:
+        query_notification_contacts = "SHOW CONTACTS"
+        
+        df_contacts = execute_query(query_notification_contacts)
+        
+        if not df_contacts.empty:
+            total_contacts = len(df_contacts)
+            
+            st.metric("Configured Contacts", f"{total_contacts:,.0f}")
+            
+            st.success(f"✅ Your account has {total_contacts} notification contact(s) configured!")
+            
+            st.dataframe(
+                df_contacts,
+                hide_index=True,
+                use_container_width=True
+            )
+            
+            st.info("""
+            💡 **Contacts** are used to receive notifications from Snowflake about:
+            - Account security updates
+            - Product updates and announcements
+            - Service notifications
+            - Data governance alerts
+            
+            **How to add contacts:**
+            1. Navigate to **Admin > Contacts** in Snowsight
+            2. Click **+ Contact** to add a new contact
+            3. Specify email address and notification types
+            """)
+        else:
+            st.markdown('<div class="danger-card">', unsafe_allow_html=True)
+            st.error("⚠️ **Critical**: No notification contacts configured. You won't receive important updates from Snowflake.")
+            st.markdown('</div>', unsafe_allow_html=True)
+            st.code("""
+-- To create a contact (requires ACCOUNTADMIN):
+CREATE CONTACT admin_contact
+    TYPE = EMAIL
+    EMAIL = 'admin@yourcompany.com'
+    COMMENT = 'Primary admin contact for security notifications';
+
+-- Or use Snowsight: Admin > Contacts > + Contact
+            """, language="sql")
+            
+    except Exception as e:
+        st.warning(f"Unable to fetch notification contacts: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Query 6: Failed Login Attempts
+    st.subheader("6. Failed Authentication Attempts")
     
     query_failed_logins = f"""
     SELECT 
@@ -2181,6 +2676,159 @@ with tab4:
             
     except Exception as e:
         st.error(f"Error fetching failed login data: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Query 7: Data Governance Metrics
+    st.subheader("7. Data Governance & Security Policies")
+    
+    try:
+        query_governance = """
+        WITH tagged_tables AS (
+            SELECT COUNT(DISTINCT CONCAT(object_database, '.', object_schema, '.', object_name)) as count
+            FROM snowflake.account_usage.tag_references
+            WHERE object_deleted IS NULL
+                AND domain = 'TABLE'
+        ),
+        tables_with_rap AS (
+            SELECT COUNT(DISTINCT CONCAT(ref_database_name, '.', ref_schema_name, '.', ref_entity_name)) as count
+            FROM snowflake.account_usage.policy_references
+            WHERE policy_kind = 'ROW_ACCESS_POLICY'
+                AND ref_entity_domain = 'TABLE'
+                AND policy_status = 'ACTIVE'
+        ),
+        tagged_columns AS (
+            SELECT COUNT(DISTINCT CONCAT(object_database, '.', object_schema, '.', object_name, '.', column_name)) as count
+            FROM snowflake.account_usage.tag_references
+            WHERE object_deleted IS NULL
+                AND domain = 'COLUMN'
+        ),
+        columns_with_masking AS (
+            SELECT COUNT(DISTINCT CONCAT(ref_database_name, '.', ref_schema_name, '.', ref_entity_name, '.', ref_column_name)) as count
+            FROM snowflake.account_usage.policy_references
+            WHERE policy_kind = 'MASKING_POLICY'
+                AND ref_entity_domain = 'COLUMN'
+                AND policy_status = 'ACTIVE'
+        ),
+        total_tables AS (
+            SELECT COUNT(*) as count
+            FROM snowflake.account_usage.tables
+            WHERE deleted IS NULL
+                AND table_type = 'BASE TABLE'
+        ),
+        total_columns AS (
+            SELECT COUNT(*) as count
+            FROM snowflake.account_usage.columns
+            WHERE deleted IS NULL
+        )
+        SELECT
+            tt.count as tagged_tables,
+            (SELECT count FROM total_tables) as total_tables,
+            rap.count as tables_with_row_access_policy,
+            tc.count as tagged_columns,
+            (SELECT count FROM total_columns) as total_columns,
+            mp.count as columns_with_masking_policy
+        FROM tagged_tables tt, tables_with_rap rap, tagged_columns tc, columns_with_masking mp
+        """
+        
+        df_governance = execute_query(query_governance)
+        
+        if not df_governance.empty:
+            row = df_governance.iloc[0]
+            
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                tagged_pct = (row['TAGGED_TABLES'] / row['TOTAL_TABLES'] * 100) if row['TOTAL_TABLES'] > 0 else 0
+                st.metric(
+                    "Tagged Tables",
+                    f"{row['TAGGED_TABLES']:,.0f}",
+                    f"{tagged_pct:.1f}% of {row['TOTAL_TABLES']:,.0f}"
+                )
+            
+            with col2:
+                rap_pct = (row['TABLES_WITH_ROW_ACCESS_POLICY'] / row['TOTAL_TABLES'] * 100) if row['TOTAL_TABLES'] > 0 else 0
+                st.metric(
+                    "Tables with Row Access Policy",
+                    f"{row['TABLES_WITH_ROW_ACCESS_POLICY']:,.0f}",
+                    f"{rap_pct:.1f}% of {row['TOTAL_TABLES']:,.0f}"
+                )
+            
+            with col3:
+                tagged_col_pct = (row['TAGGED_COLUMNS'] / row['TOTAL_COLUMNS'] * 100) if row['TOTAL_COLUMNS'] > 0 else 0
+                st.metric(
+                    "Tagged Columns",
+                    f"{row['TAGGED_COLUMNS']:,.0f}",
+                    f"{tagged_col_pct:.1f}% of {row['TOTAL_COLUMNS']:,.0f}"
+                )
+            
+            with col4:
+                masked_pct = (row['COLUMNS_WITH_MASKING_POLICY'] / row['TOTAL_COLUMNS'] * 100) if row['TOTAL_COLUMNS'] > 0 else 0
+                st.metric(
+                    "Columns with Masking Policy",
+                    f"{row['COLUMNS_WITH_MASKING_POLICY']:,.0f}",
+                    f"{masked_pct:.1f}% of {row['TOTAL_COLUMNS']:,.0f}"
+                )
+            
+            # Recommendations based on metrics
+            recommendations = []
+            if tagged_pct < 20:
+                recommendations.append("📌 **Low table tagging**: Consider implementing a tagging strategy to classify your data assets.")
+            if rap_pct < 5:
+                recommendations.append("🔒 **Limited row-level security**: Review if any tables contain sensitive data that should have row access policies.")
+            if masked_pct < 5:
+                recommendations.append("🎭 **Limited data masking**: Review if any columns contain PII/sensitive data that should be masked.")
+            
+            if recommendations:
+                st.markdown('<div class="warning-card">', unsafe_allow_html=True)
+                st.warning("**Data Governance Recommendations:**")
+                for rec in recommendations:
+                    st.markdown(f"- {rec}")
+                st.markdown('</div>', unsafe_allow_html=True)
+            else:
+                st.success("✅ Good data governance posture detected.")
+            
+            st.info("💡 **Learn more**: [Snowflake Data Governance](https://docs.snowflake.com/en/guides-overview-govern)")
+        
+    except Exception as e:
+        st.warning(f"Unable to fetch data governance metrics: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Query 8: Trust Center Security Violations
+    st.subheader("8. Trust Center Security Violations")
+    
+    st.markdown("""
+    **Trust Center** provides security posture monitoring and compliance insights for your Snowflake account.
+    
+    🔗 **[Open Trust Center in Snowsight →](https://app.snowflake.com/trust-center)**
+    """)
+    
+    try:
+        # Note: Trust Center data is not yet available via SQL in ACCOUNT_USAGE
+        # This is a placeholder for when Snowflake adds this functionality
+        st.info("""
+        ℹ️ **How to check security violations:**
+        
+        1. Navigate to [Trust Center](https://app.snowflake.com/trust-center) in Snowsight
+        2. Review the **Security Posture** dashboard
+        3. Check for any "Open Violations" or "High Priority" items
+        4. Follow remediation guidance for each violation
+        
+        **Common violations to watch for:**
+        - Unencrypted network connections
+        - Inactive users with access
+        - Overly permissive roles
+        - Missing MFA on privileged accounts
+        - Stale access grants
+        """)
+        
+        st.markdown('<div class="warning-card">', unsafe_allow_html=True)
+        st.warning("⚠️ **Manual Review Required**: Trust Center violations are not yet queryable via SQL. Please review manually in Snowsight.")
+        st.markdown('</div>', unsafe_allow_html=True)
+        
+    except Exception as e:
+        st.warning(f"Unable to fetch Trust Center data: {str(e)}")
 
 # ============================================================================
 # TAB 5: COST OPTIMIZATION
@@ -2191,8 +2839,294 @@ with tab5:
     Best practices from [Snowflake Well-Architected Framework - Cost Optimization](https://www.snowflake.com/en/developers/guides/well-architected-framework-cost-optimization-and-finops/)
     """)
     
+    # Billing Model Selector
+    st.markdown("---")
+    billing_model = st.radio(
+        "**Select Your Billing Model:**",
+        options=["On-Demand", "Reserved Capacity (Contract)"],
+        horizontal=True,
+        help="Select 'Reserved Capacity' if you have a Snowflake contract with upfront capacity commitment. Select 'On-Demand' for pay-as-you-go billing."
+    )
+    use_demo_data = False  # Demo data removed
+    
+    # Show billing reconciliation for Reserved Capacity customers
+    if billing_model == "Reserved Capacity (Contract)":
+        st.markdown("---")
+        st.subheader("📊 Contract & Billing Reconciliation")
+        st.info("💡 **Note**: These views use Organization Usage schema. Ensure you have ORGADMIN or ACCOUNTADMIN role with appropriate permissions.")
+        
+        # Reference: https://docs.snowflake.com/en/user-guide/billing-reconcile
+        
+        # Get current contract information
+        st.markdown("**Current Contract Status:**")
+        
+        try:
+            if use_demo_data:
+                # Generate sample data for demonstration
+                import datetime
+                df_balance = pd.DataFrame({
+                    'DATE': [datetime.date.today() - datetime.timedelta(days=1)],
+                    'CONTRACT_NUMBER': ['SF-12345-2024'],
+                    'ORGANIZATION_NAME': ['ACME Corporation'],
+                    'CURRENCY': ['USD'],
+                    'CAPACITY_BALANCE': [750000.00],
+                    'FREE_USAGE_BALANCE': [25000.00],
+                    'ROLLOVER_BALANCE': [50000.00],
+                    'REMAINING_BALANCE': [825000.00]
+                })
+                st.info("📊 **Demo Mode**: Showing sample data. This represents a $1M contract with $825K remaining.")
+            else:
+                # Query for remaining balance
+                query_remaining_balance = """
+                SELECT 
+                    date,
+                    contract_number,
+                    organization_name,
+                    currency,
+                    capacity_balance,
+                    free_usage_balance,
+                    rollover_balance,
+                    (capacity_balance + free_usage_balance + rollover_balance) AS remaining_balance
+                FROM snowflake.organization_usage.remaining_balance_daily
+                WHERE date = CURRENT_DATE() - 1
+                ORDER BY contract_number
+                """
+                
+                df_balance = execute_query(query_remaining_balance)
+            
+            if not df_balance.empty:
+                # Display metrics for each contract
+                for idx, row in df_balance.iterrows():
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Contract", row['CONTRACT_NUMBER'])
+                    with col2:
+                        st.metric("Remaining Balance", f"{row['CURRENCY']} {row['REMAINING_BALANCE']:,.2f}")
+                    with col3:
+                        st.metric("Capacity Balance", f"{row['CURRENCY']} {row['CAPACITY_BALANCE']:,.2f}")
+                    with col4:
+                        st.metric("Free Usage Balance", f"{row['CURRENCY']} {row['FREE_USAGE_BALANCE']:,.2f}")
+                
+                st.dataframe(
+                    df_balance,
+                    column_config={
+                        "DATE": "Date",
+                        "CONTRACT_NUMBER": "Contract Number",
+                        "ORGANIZATION_NAME": "Organization",
+                        "CURRENCY": "Currency",
+                        "CAPACITY_BALANCE": st.column_config.NumberColumn("Capacity Balance", format="%.2f"),
+                        "FREE_USAGE_BALANCE": st.column_config.NumberColumn("Free Usage", format="%.2f"),
+                        "ROLLOVER_BALANCE": st.column_config.NumberColumn("Rollover", format="%.2f"),
+                        "REMAINING_BALANCE": st.column_config.NumberColumn("Total Remaining", format="%.2f")
+                    },
+                    hide_index=True,
+                    use_container_width=True
+                )
+            else:
+                st.warning("⚠️ No contract balance data found. You may need ORGADMIN privileges or your organization may not have a contract.")
+                
+        except Exception as e:
+            st.warning(f"⚠️ Unable to access organization usage data: {str(e)}\n\nThis typically means you need ORGADMIN or ACCOUNTADMIN role with organization access.")
+        
+        st.markdown("---")
+        st.markdown("**Monthly Usage by Contract:**")
+        
+        try:
+            if use_demo_data:
+                # Generate sample monthly usage data
+                import datetime
+                today = datetime.date.today()
+                months = []
+                for i in range(3):
+                    month_date = today - datetime.timedelta(days=30 * (i+1))
+                    month_start = month_date.replace(day=1)
+                    months.append(month_start)
+                
+                # Create sample data for multiple accounts
+                data = []
+                accounts = ['ABC123-US-EAST-1', 'DEF456-US-WEST-2', 'GHI789-EU-CENTRAL-1']
+                base_usage = [45000, 32000, 18000]  # Different usage per account
+                
+                for month_idx, month in enumerate(months):
+                    for acc_idx, account in enumerate(accounts):
+                        # Add some variation month to month
+                        variation = 1 + (0.1 * (month_idx - 1))  # -10% to +10%
+                        consumed = base_usage[acc_idx] * variation
+                        credits = consumed / 3  # Rough conversion
+                        
+                        data.append({
+                            'CONTRACT_NUMBER': 'SF-12345-2024',
+                            'USAGE_MONTH': pd.Timestamp(month),
+                            'ACCOUNT_NAME': account,
+                            'TOTAL_CONSUMED': consumed,
+                            'TOTAL_CREDITS': credits
+                        })
+                
+                df_monthly = pd.DataFrame(data)
+                st.info("📊 **Demo Mode**: Showing sample 3-month usage across 3 accounts.")
+            else:
+                # Query for monthly usage by contract
+                query_monthly_usage = f"""
+                SELECT 
+                    contract_number,
+                    DATE_TRUNC('month', usage_date) AS usage_month,
+                    CONCAT(account_locator, '-', region) AS account_name,
+                    SUM(usage_in_currency) AS total_consumed,
+                    SUM(usage) AS total_credits
+                FROM snowflake.organization_usage.usage_in_currency_daily
+                WHERE TRUE
+                    AND usage_date >= DATEADD(month, -3, CURRENT_DATE())
+                    AND LOWER(balance_source) != 'overage'
+                GROUP BY 1, 2, 3
+                ORDER BY 1, 2 DESC, 4 DESC
+                LIMIT 100
+                """
+                
+                df_monthly = execute_query(query_monthly_usage)
+            
+            if not df_monthly.empty:
+                # Chart: Monthly consumption trend
+                df_monthly_summary = df_monthly.groupby('USAGE_MONTH')['TOTAL_CONSUMED'].sum().reset_index()
+                fig_monthly_trend = px.line(
+                    df_monthly_summary,
+                    x='USAGE_MONTH',
+                    y='TOTAL_CONSUMED',
+                    title='Monthly Consumption Trend (Last 3 Months)',
+                    labels={'TOTAL_CONSUMED': 'Currency Consumed', 'USAGE_MONTH': 'Month'},
+                    markers=True
+                )
+                st.plotly_chart(fig_monthly_trend, use_container_width=True)
+                
+                # Detailed table
+                st.dataframe(
+                    df_monthly.head(50),
+                    column_config={
+                        "CONTRACT_NUMBER": "Contract",
+                        "USAGE_MONTH": "Month",
+                        "ACCOUNT_NAME": "Account",
+                        "TOTAL_CONSUMED": st.column_config.NumberColumn("Currency Consumed", format="%.2f"),
+                        "TOTAL_CREDITS": st.column_config.NumberColumn("Credits Used", format="%.2f")
+                    },
+                    hide_index=True,
+                    use_container_width=True
+                )
+            else:
+                st.info("No monthly usage data available.")
+                
+        except Exception as e:
+            st.warning(f"Unable to access monthly usage data: {str(e)}")
+        
+        st.markdown("---")
+        st.markdown("**Usage by Category:**")
+        
+        try:
+            if use_demo_data:
+                # Generate sample usage by category data
+                import datetime
+                today = datetime.date.today()
+                current_month = today.replace(day=1)
+                
+                # Realistic usage categories with sample data
+                categories = [
+                    ('WAREHOUSE_METERING', 'ABC123-US-EAST-1', 12500, 35000),
+                    ('WAREHOUSE_METERING', 'DEF456-US-WEST-2', 8200, 25000),
+                    ('WAREHOUSE_METERING', 'GHI789-EU-CENTRAL-1', 5300, 16000),
+                    ('AUTOMATIC_CLUSTERING', 'ABC123-US-EAST-1', 450, 3500),
+                    ('AUTOMATIC_CLUSTERING', 'DEF456-US-WEST-2', 280, 2100),
+                    ('MATERIALIZED_VIEW_MAINTENANCE', 'ABC123-US-EAST-1', 320, 2800),
+                    ('SNOWPIPE', 'ABC123-US-EAST-1', 180, 1800),
+                    ('SNOWPIPE', 'DEF456-US-WEST-2', 95, 950),
+                    ('REPLICATION', 'ABC123-US-EAST-1', 85, 850),
+                    ('QUERY_ACCELERATION', 'DEF456-US-WEST-2', 45, 450),
+                    ('SEARCH_OPTIMIZATION', 'ABC123-US-EAST-1', 35, 350),
+                    ('CLOUD_SERVICES', 'ABC123-US-EAST-1', 125, 0),  # Often zero cost
+                    ('CLOUD_SERVICES', 'DEF456-US-WEST-2', 82, 0),
+                    ('DATA_TRANSFER', 'GHI789-EU-CENTRAL-1', 28, 280)
+                ]
+                
+                data = []
+                for category, account, units, cost in categories:
+                    data.append({
+                        'CONTRACT_NUMBER': 'SF-12345-2024',
+                        'USAGE_MONTH': pd.Timestamp(current_month),
+                        'ACCOUNT_NAME': account,
+                        'USAGE_CATEGORY': category,
+                        'UNITS_CONSUMED': units,
+                        'TOTAL_USAGE': cost
+                    })
+                
+                df_usage_type = pd.DataFrame(data)
+                st.info("📊 **Demo Mode**: Showing sample usage breakdown by Snowflake service category.")
+            else:
+                # Query for usage by type
+                query_usage_by_type = f"""
+                SELECT 
+                    contract_number,
+                    DATE_TRUNC('month', usage_date) AS usage_month,
+                    CONCAT(account_locator, '-', region) AS account_name,
+                    usage_type AS usage_category,
+                    SUM(usage) AS units_consumed,
+                    SUM(usage_in_currency) AS total_usage
+                FROM snowflake.organization_usage.usage_in_currency_daily
+                WHERE TRUE
+                    AND usage_date >= DATEADD(month, -1, CURRENT_DATE())
+                    AND LOWER(balance_source) != 'overage'
+                GROUP BY 1, 2, 3, 4
+                ORDER BY 6 DESC
+                LIMIT 50
+                """
+                
+                df_usage_type = execute_query(query_usage_by_type)
+            
+            if not df_usage_type.empty:
+                # Chart: Top usage categories
+                df_category_summary = df_usage_type.groupby('USAGE_CATEGORY')['TOTAL_USAGE'].sum().reset_index().sort_values('TOTAL_USAGE', ascending=False).head(10)
+                fig_categories = px.bar(
+                    df_category_summary,
+                    x='USAGE_CATEGORY',
+                    y='TOTAL_USAGE',
+                    title='Top 10 Usage Categories (Last Month)',
+                    labels={'TOTAL_USAGE': 'Currency Spent', 'USAGE_CATEGORY': 'Category'},
+                    color='TOTAL_USAGE',
+                    color_continuous_scale='Blues'
+                )
+                st.plotly_chart(fig_categories, use_container_width=True)
+                
+                # Detailed table
+                st.dataframe(
+                    df_usage_type,
+                    column_config={
+                        "CONTRACT_NUMBER": "Contract",
+                        "USAGE_MONTH": "Month",
+                        "ACCOUNT_NAME": "Account",
+                        "USAGE_CATEGORY": "Category",
+                        "UNITS_CONSUMED": st.column_config.NumberColumn("Units", format="%.2f"),
+                        "TOTAL_USAGE": st.column_config.NumberColumn("Currency Spent", format="%.2f")
+                    },
+                    hide_index=True,
+                    use_container_width=True
+                )
+                
+                st.info("💡 **Tip**: Use this breakdown to identify which Snowflake features are consuming the most from your contract. Focus optimization efforts on high-cost categories.")
+            else:
+                st.info("No usage category data available.")
+                
+        except Exception as e:
+            st.warning(f"Unable to access usage category data: {str(e)}")
+        
+        st.markdown("---")
+        st.info("""
+        📚 **Documentation Reference**: 
+        [Snowflake Billing Reconciliation Guide](https://docs.snowflake.com/en/user-guide/billing-reconcile)
+        
+        These queries help you reconcile your usage statement with Organization Usage data.
+        """)
+    
+    st.markdown("---")
+    
     # Query 1: Credit Usage by Service
-    st.subheader("1. Credit Consumption Overview")
+    section_prefix = "2." if billing_model == "Reserved Capacity (Contract)" else "1."
+    st.subheader(f"{section_prefix} Credit Consumption Overview")
     
     query_credit_usage = f"""
     SELECT 
@@ -2253,7 +3187,8 @@ with tab5:
     st.markdown("---")
     
     # Query 2: Warehouse Cost Analysis
-    st.subheader("2. Warehouse Cost Analysis")
+    section_num = 3 if billing_model == "Reserved Capacity (Contract)" else 2
+    st.subheader(f"{section_num}. Warehouse Cost Analysis")
     
     query_wh_cost = f"""
     SELECT 
@@ -2314,7 +3249,8 @@ with tab5:
     st.markdown("---")
     
     # Query 3: Storage Costs
-    st.subheader("3. Storage Cost Analysis")
+    section_num = 4 if billing_model == "Reserved Capacity (Contract)" else 3
+    st.subheader(f"{section_num}. Storage Cost Analysis")
     
     query_storage = f"""
     SELECT 
@@ -2370,7 +3306,8 @@ with tab5:
     st.markdown("---")
     
     # Query 4: Idle Warehouse Detection
-    st.subheader("4. Idle Warehouse Detection")
+    section_num = 5 if billing_model == "Reserved Capacity (Contract)" else 4
+    st.subheader(f"{section_num}. Idle Warehouse Detection")
     
     try:
         # Get warehouse list using SHOW WAREHOUSES
@@ -2448,7 +3385,8 @@ with tab5:
     st.markdown("---")
     
     # Query 5: Storage Optimization Opportunities
-    st.subheader("5. Storage Optimization Opportunities")
+    section_num = 6 if billing_model == "Reserved Capacity (Contract)" else 5
+    st.subheader(f"{section_num}. Storage Optimization Opportunities")
     
     query_table_storage = f"""
     WITH table_storage AS (
@@ -2542,7 +3480,8 @@ with tab5:
     st.markdown("---")
     
     # Query 6: Tables Storage Usage with Time Travel
-    st.subheader("6. Tables Storage Usage with Time Travel")
+    section_num = 7 if billing_model == "Reserved Capacity (Contract)" else 6
+    st.subheader(f"{section_num}. Tables Storage Usage with Time Travel")
     
     query_time_travel_storage = """
     SELECT 
@@ -2665,7 +3604,8 @@ with tab5:
     st.markdown("---")
     
     # Query 7: Use of Iceberg Tables (Gen2)
-    st.subheader("7. Iceberg Tables (Gen2) Usage")
+    section_num = 8 if billing_model == "Reserved Capacity (Contract)" else 7
+    st.subheader(f"{section_num}. Iceberg Tables (Gen2) Usage")
     
     query_iceberg_tables = """
     SELECT 
