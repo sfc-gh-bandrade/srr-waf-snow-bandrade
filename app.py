@@ -1277,8 +1277,8 @@ with tab2:
                         "PIPE_NAME": "Pipe Name",
                         "LOAD_EVENTS": "Load Events",
                         "TOTAL_FILES_LOADED": st.column_config.NumberColumn("Files Loaded", format="%d"),
+                        "TOTAL_ROWS_LOADED": st.column_config.NumberColumn("Rows Loaded", format="%d"),
                         "TOTAL_GB_LOADED": st.column_config.NumberColumn("GB Loaded", format="%.2f"),
-                        "TOTAL_GB_BILLED": st.column_config.NumberColumn("GB Billed", format="%.2f"),
                         "TOTAL_CREDITS_USED": st.column_config.NumberColumn("Credits Used", format="%.4f"),
                         "LAST_LOAD_TIME": "Last Load",
                         "HOURS_SINCE_LAST_LOAD": st.column_config.NumberColumn("Hours Since Last", format="%d")
@@ -1625,29 +1625,48 @@ with tab3:
         # Rename columns for consistency - handle both quoted and unquoted column names
         column_mapping = {}
         for col in df_wh_config.columns:
-            col_lower = col.lower()
-            if col_lower == 'name':
+            # Strip quotes and convert to lowercase for comparison
+            col_clean = col.strip('"').lower()
+            if col_clean == 'name':
                 column_mapping[col] = 'WAREHOUSE_NAME'
-            elif col_lower == 'size':
+            elif col_clean == 'size':
                 column_mapping[col] = 'WAREHOUSE_SIZE'
-            elif col_lower == 'type':
+            elif col_clean == 'type':
                 column_mapping[col] = 'WAREHOUSE_TYPE'
-            elif col_lower == 'auto_suspend':
+            elif col_clean == 'auto_suspend':
                 column_mapping[col] = 'AUTO_SUSPEND'
-            elif col_lower == 'auto_resume':
+            elif col_clean == 'auto_resume':
                 column_mapping[col] = 'AUTO_RESUME'
-            elif col_lower == 'min_cluster_count':
+            elif col_clean == 'min_cluster_count':
                 column_mapping[col] = 'MIN_CLUSTER_COUNT'
-            elif col_lower == 'max_cluster_count':
+            elif col_clean == 'max_cluster_count':
                 column_mapping[col] = 'MAX_CLUSTER_COUNT'
-            elif col_lower == 'scaling_policy':
+            elif col_clean == 'scaling_policy':
                 column_mapping[col] = 'SCALING_POLICY'
         
         df_wh_config.rename(columns=column_mapping, inplace=True)
         
+        # Ensure required columns exist (fallback if mapping didn't work)
+        if 'AUTO_SUSPEND' not in df_wh_config.columns:
+            # Try to find the actual column name
+            for col in df_wh_config.columns:
+                if 'suspend' in col.strip('"').lower():
+                    df_wh_config['AUTO_SUSPEND'] = df_wh_config[col]
+                    break
+        
+        if 'AUTO_RESUME' not in df_wh_config.columns:
+            for col in df_wh_config.columns:
+                if 'resume' in col.strip('"').lower():
+                    df_wh_config['AUTO_RESUME'] = df_wh_config[col]
+                    break
+        
         # Check for warehouses without auto-suspend (NULL or 0)
-        no_auto_suspend = df_wh_config[df_wh_config['AUTO_SUSPEND'].isnull() | (df_wh_config['AUTO_SUSPEND'] == 0)]
-        long_auto_suspend = df_wh_config[df_wh_config['AUTO_SUSPEND'] > 600]
+        if 'AUTO_SUSPEND' in df_wh_config.columns:
+            no_auto_suspend = df_wh_config[df_wh_config['AUTO_SUSPEND'].isnull() | (df_wh_config['AUTO_SUSPEND'] == 0)]
+            long_auto_suspend = df_wh_config[df_wh_config['AUTO_SUSPEND'] > 600]
+        else:
+            no_auto_suspend = pd.DataFrame()
+            long_auto_suspend = pd.DataFrame()
         
         col1, col2, col3 = st.columns(3)
         
@@ -1661,13 +1680,21 @@ with tab3:
         if len(no_auto_suspend) > 0:
             st.markdown('<div class="danger-card">', unsafe_allow_html=True)
             st.error(f"⚠️ **Critical**: {len(no_auto_suspend)} warehouse(s) without auto-suspend will run continuously!")
-            st.dataframe(no_auto_suspend[['WAREHOUSE_NAME', 'WAREHOUSE_SIZE', 'AUTO_SUSPEND', 'AUTO_RESUME']], hide_index=True)
+            display_cols = ['WAREHOUSE_NAME', 'WAREHOUSE_SIZE']
+            if 'AUTO_SUSPEND' in no_auto_suspend.columns:
+                display_cols.append('AUTO_SUSPEND')
+            if 'AUTO_RESUME' in no_auto_suspend.columns:
+                display_cols.append('AUTO_RESUME')
+            st.dataframe(no_auto_suspend[display_cols], hide_index=True)
             st.markdown('</div>', unsafe_allow_html=True)
         
         if len(long_auto_suspend) > 0:
             st.markdown('<div class="warning-card">', unsafe_allow_html=True)
             st.warning(f"⚠️ **Recommendation**: {len(long_auto_suspend)} warehouse(s) have auto-suspend > 10 minutes. Consider reducing to 60-300 seconds for cost optimization.")
-            st.dataframe(long_auto_suspend[['WAREHOUSE_NAME', 'WAREHOUSE_SIZE', 'AUTO_SUSPEND']], hide_index=True)
+            display_cols = ['WAREHOUSE_NAME', 'WAREHOUSE_SIZE']
+            if 'AUTO_SUSPEND' in long_auto_suspend.columns:
+                display_cols.append('AUTO_SUSPEND')
+            st.dataframe(long_auto_suspend[display_cols], hide_index=True)
             st.markdown('</div>', unsafe_allow_html=True)
         
         if len(no_auto_suspend) == 0 and len(long_auto_suspend) == 0:
@@ -1675,18 +1702,27 @@ with tab3:
         
         # Display full configuration
         st.markdown("**Warehouse Configuration Details:**")
+        column_config = {}
+        if 'WAREHOUSE_NAME' in df_wh_config.columns:
+            column_config["WAREHOUSE_NAME"] = "Warehouse"
+        if 'WAREHOUSE_SIZE' in df_wh_config.columns:
+            column_config["WAREHOUSE_SIZE"] = "Size"
+        if 'WAREHOUSE_TYPE' in df_wh_config.columns:
+            column_config["WAREHOUSE_TYPE"] = "Type"
+        if 'AUTO_SUSPEND' in df_wh_config.columns:
+            column_config["AUTO_SUSPEND"] = "Auto-Suspend (sec)"
+        if 'AUTO_RESUME' in df_wh_config.columns:
+            column_config["AUTO_RESUME"] = "Auto-Resume"
+        if 'MIN_CLUSTER_COUNT' in df_wh_config.columns:
+            column_config["MIN_CLUSTER_COUNT"] = "Min Clusters"
+        if 'MAX_CLUSTER_COUNT' in df_wh_config.columns:
+            column_config["MAX_CLUSTER_COUNT"] = "Max Clusters"
+        if 'SCALING_POLICY' in df_wh_config.columns:
+            column_config["SCALING_POLICY"] = "Scaling Policy"
+        
         st.dataframe(
             df_wh_config,
-            column_config={
-                "WAREHOUSE_NAME": "Warehouse",
-                "WAREHOUSE_SIZE": "Size",
-                "WAREHOUSE_TYPE": "Type",
-                "AUTO_SUSPEND": "Auto-Suspend (sec)",
-                "AUTO_RESUME": "Auto-Resume",
-                "MIN_CLUSTER_COUNT": "Min Clusters",
-                "MAX_CLUSTER_COUNT": "Max Clusters",
-                "SCALING_POLICY": "Scaling Policy"
-            },
+            column_config=column_config,
             hide_index=True,
             use_container_width=True
         )
@@ -1777,6 +1813,95 @@ with tab3:
                     st.markdown('<div class="warning-card">', unsafe_allow_html=True)
                     st.warning(f"⚠️ **{len(high_idle)} warehouse(s) have >20% idle time**. Consider reducing auto-suspend timeout to minimize idle costs.")
                     st.markdown('</div>', unsafe_allow_html=True)
+                
+                # Hourly idle pattern analysis for top 5 warehouses
+                st.markdown("---")
+                st.markdown("**Hourly Idle Patterns - Last 7 Days (Top 5 Warehouses):**")
+                
+                # Get top 5 warehouses by idle credits
+                top5_warehouses = df_idle.head(5)['WAREHOUSE_NAME'].tolist()
+                
+                query_hourly_idle = f"""
+                WITH hourly_usage AS (
+                    SELECT
+                        warehouse_name,
+                        HOUR(start_time) as hour_of_day,
+                        SUM(credits_used_compute) as total_compute_credits,
+                        SUM(credits_attributed_compute_queries) as query_credits,
+                        (SUM(credits_used_compute) - SUM(credits_attributed_compute_queries)) as idle_credits
+                    FROM snowflake.account_usage.warehouse_metering_history
+                    WHERE start_time >= DATEADD(day, -7, CURRENT_TIMESTAMP())
+                        AND warehouse_name IN ('{"','".join(top5_warehouses)}')
+                    GROUP BY warehouse_name, HOUR(start_time)
+                )
+                SELECT
+                    warehouse_name,
+                    hour_of_day,
+                    idle_credits,
+                    CASE 
+                        WHEN total_compute_credits > 0 
+                        THEN (idle_credits / total_compute_credits) * 100
+                        ELSE 0 
+                    END as idle_pct
+                FROM hourly_usage
+                WHERE idle_credits > 0
+                ORDER BY warehouse_name, hour_of_day
+                """
+                
+                try:
+                    df_hourly_idle = session.sql(query_hourly_idle).to_pandas()
+                    
+                    if not df_hourly_idle.empty:
+                        # Create pivot table for heatmap
+                        df_pivot = df_hourly_idle.pivot(
+                            index='WAREHOUSE_NAME',
+                            columns='HOUR_OF_DAY',
+                            values='IDLE_PCT'
+                        ).fillna(0)
+                        
+                        # Ensure all hours 0-23 are present
+                        for hour in range(24):
+                            if hour not in df_pivot.columns:
+                                df_pivot[hour] = 0
+                        df_pivot = df_pivot.sort_index(axis=1)
+                        
+                        # Create heatmap
+                        fig_heatmap = px.imshow(
+                            df_pivot,
+                            labels=dict(x="Hour of Day", y="Warehouse", color="Idle %"),
+                            x=[f"{h:02d}:00" for h in range(24)],
+                            y=df_pivot.index,
+                            aspect="auto",
+                            color_continuous_scale="Reds",
+                            title="Idle Time Patterns by Hour of Day - Last 7 Days (Top 5 Warehouses)"
+                        )
+                        fig_heatmap.update_layout(height=400)
+                        st.plotly_chart(fig_heatmap, use_container_width=True)
+                        
+                        # Create line chart as alternative view
+                        fig_line = px.line(
+                            df_hourly_idle,
+                            x='HOUR_OF_DAY',
+                            y='IDLE_PCT',
+                            color='WAREHOUSE_NAME',
+                            title='Idle Time % Throughout the Day - Last 7 Days (Top 5 Warehouses)',
+                            labels={'HOUR_OF_DAY': 'Hour of Day', 'IDLE_PCT': 'Idle Time %', 'WAREHOUSE_NAME': 'Warehouse'},
+                            markers=True
+                        )
+                        fig_line.update_xaxes(
+                            tickmode='linear',
+                            tick0=0,
+                            dtick=2,
+                            range=[0, 23]
+                        )
+                        st.plotly_chart(fig_line, use_container_width=True)
+                        
+                        st.info("💡 **Insight**: The heatmap and line chart show when warehouses are idle throughout the day. Dark red areas indicate high idle time. Consider adjusting auto-suspend timeouts or scheduling queries to avoid idle periods.")
+                    else:
+                        st.info("Insufficient hourly data for idle pattern analysis.")
+                        
+                except Exception as e:
+                    st.info(f"Hourly idle pattern analysis unavailable: {str(e)}")
                 
                 st.info("💡 **Tip**: Idle time occurs when warehouses are running but not executing queries. Reduce auto-suspend timeouts (60-300 seconds) to minimize idle credits.")
             else:

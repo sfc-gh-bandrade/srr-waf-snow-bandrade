@@ -1076,6 +1076,320 @@ with tab2:
     except Exception as e:
         st.error(f"Error fetching failure data: {str(e)}")
 
+    st.markdown("---")
+    
+    # Query 3: Data Pipeline Reliability (Snowpipe)
+    st.subheader("3. Data Pipeline Reliability (Snowpipe)")
+    
+    query_pipes = """
+    SELECT 
+        pipe_catalog,
+        pipe_schema,
+        pipe_name,
+        pipe_owner,
+        is_autoingest_enabled,
+        created,
+        last_altered,
+        DATEDIFF(day, last_altered, CURRENT_TIMESTAMP()) as days_since_modified,
+        DATEDIFF(day, created, CURRENT_TIMESTAMP()) as pipe_age_days
+    FROM snowflake.account_usage.pipes
+    WHERE deleted IS NULL
+    ORDER BY pipe_catalog, pipe_schema, pipe_name
+    """
+    
+    try:
+        df_pipes = execute_query(query_pipes)
+        
+        if not df_pipes.empty:
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.metric("Total Active Pipes", len(df_pipes))
+                autoingest_enabled = len(df_pipes[df_pipes['IS_AUTOINGEST_ENABLED'] == 'true'])
+                st.metric("Auto-Ingest Enabled", autoingest_enabled)
+            
+            with col2:
+                avg_age = df_pipes['PIPE_AGE_DAYS'].mean()
+                st.metric("Avg Pipe Age", f"{avg_age:.0f} days")
+                stale_pipes = len(df_pipes[df_pipes['DAYS_SINCE_MODIFIED'] > 90])
+                st.metric("Stale Pipes (>90 days)", stale_pipes)
+            
+            # Pie chart for auto-ingest configuration
+            autoingest_counts = df_pipes['IS_AUTOINGEST_ENABLED'].value_counts()
+            fig_autoingest = px.pie(
+                values=autoingest_counts.values,
+                names=['Auto-Ingest: ' + str(name) for name in autoingest_counts.index],
+                title='Auto-Ingest Configuration',
+                hole=0.4
+            )
+            st.plotly_chart(fig_autoingest, use_container_width=True)
+            
+            st.markdown("**Pipe Configuration:**")
+            st.dataframe(
+                df_pipes,
+                column_config={
+                    "PIPE_CATALOG": "Database",
+                    "PIPE_SCHEMA": "Schema",
+                    "PIPE_NAME": "Pipe Name",
+                    "PIPE_OWNER": "Owner Role",
+                    "IS_AUTOINGEST_ENABLED": "Auto-Ingest",
+                    "CREATED": "Created",
+                    "LAST_ALTERED": "Last Modified",
+                    "DAYS_SINCE_MODIFIED": st.column_config.NumberColumn("Days Since Modified", format="%d"),
+                    "PIPE_AGE_DAYS": st.column_config.NumberColumn("Pipe Age (days)", format="%d")
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+            
+            # Check for stale pipes
+            if stale_pipes > 0:
+                st.markdown('<div class="warning-card">', unsafe_allow_html=True)
+                st.warning(f"⚠️ **{stale_pipes} pipe(s) haven't been modified in 90+ days**. Review if these pipes are still needed or require maintenance.")
+                st.markdown('</div>', unsafe_allow_html=True)
+            
+        else:
+            st.info("✅ No Snowpipe objects found in the account.")
+            
+        # Check pipe usage and errors
+        st.markdown("---")
+        st.markdown("**Snowpipe Usage & Performance:**")
+        
+        query_pipe_usage = f"""
+        SELECT 
+            pipe_name,
+            COUNT(*) as load_events,
+            SUM(TO_NUMBER(files_inserted)) as total_files_loaded,
+            SUM(bytes_inserted) / POWER(1024, 3) as total_gb_loaded,
+            SUM(bytes_billed) / POWER(1024, 3) as total_gb_billed,
+            SUM(credits_used) as total_credits_used,
+            MAX(end_time) as last_load_time,
+            DATEDIFF(hour, MAX(end_time), CURRENT_TIMESTAMP()) as hours_since_last_load
+        FROM snowflake.account_usage.pipe_usage_history
+        WHERE start_time >= DATEADD(day, -{days_back}, CURRENT_TIMESTAMP())
+        GROUP BY pipe_name
+        ORDER BY total_credits_used DESC
+        LIMIT 20
+        """
+        
+        try:
+            df_pipe_usage = execute_query(query_pipe_usage)
+            
+            if not df_pipe_usage.empty:
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    fig_pipe_credits = px.bar(
+                        df_pipe_usage.head(10),
+                        x='PIPE_NAME',
+                        y='TOTAL_CREDITS_USED',
+                        title='Top 10 Pipes by Credits Used',
+                        labels={'TOTAL_CREDITS_USED': 'Credits Used', 'PIPE_NAME': 'Pipe Name'}
+                    )
+                    st.plotly_chart(fig_pipe_credits, use_container_width=True)
+                
+                with col2:
+                    fig_pipe_files = px.bar(
+                        df_pipe_usage.head(10),
+                        x='PIPE_NAME',
+                        y='TOTAL_FILES_LOADED',
+                        title='Top 10 Pipes by Files Loaded',
+                        labels={'TOTAL_FILES_LOADED': 'Files Loaded', 'PIPE_NAME': 'Pipe Name'}
+                    )
+                    st.plotly_chart(fig_pipe_files, use_container_width=True)
+                
+                # Summary metrics
+                total_files = df_pipe_usage['TOTAL_FILES_LOADED'].sum()
+                total_gb = df_pipe_usage['TOTAL_GB_LOADED'].sum()
+                total_gb_billed = df_pipe_usage['TOTAL_GB_BILLED'].sum()
+                total_credits = df_pipe_usage['TOTAL_CREDITS_USED'].sum()
+                
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Total Files Loaded", f"{total_files:,.0f}")
+                with col2:
+                    st.metric("Total GB Loaded", f"{total_gb:.2f}")
+                with col3:
+                    st.metric("Total GB Billed", f"{total_gb_billed:.2f}")
+                with col4:
+                    st.metric("Total Credits", f"{total_credits:.2f}")
+                
+                st.markdown("**Detailed Pipe Usage:**")
+                st.dataframe(
+                    df_pipe_usage,
+                    column_config={
+                        "PIPE_NAME": "Pipe Name",
+                        "LOAD_EVENTS": "Load Events",
+                        "TOTAL_FILES_LOADED": st.column_config.NumberColumn("Files Loaded", format="%d"),
+                        "TOTAL_GB_LOADED": st.column_config.NumberColumn("GB Loaded", format="%.2f"),
+                        "TOTAL_GB_BILLED": st.column_config.NumberColumn("GB Billed", format="%.2f"),
+                        "TOTAL_CREDITS_USED": st.column_config.NumberColumn("Credits Used", format="%.4f"),
+                        "LAST_LOAD_TIME": "Last Load",
+                        "HOURS_SINCE_LAST_LOAD": st.column_config.NumberColumn("Hours Since Last", format="%d")
+                    },
+                    hide_index=True,
+                    use_container_width=True
+                )
+                
+                # Check for inactive pipes
+                inactive_pipes = df_pipe_usage[df_pipe_usage['HOURS_SINCE_LAST_LOAD'] > 168]  # 7 days
+                if not inactive_pipes.empty:
+                    st.markdown('<div class="warning-card">', unsafe_allow_html=True)
+                    st.warning(f"⚠️ **{len(inactive_pipes)} pipe(s) haven't loaded data in 7+ days**. Verify if these pipelines are still operational.")
+                    st.markdown('</div>', unsafe_allow_html=True)
+                
+                st.info("💡 **Tip**: Monitor Snowpipe activity regularly. Set up notifications for load failures using ERROR_INTEGRATION parameter when creating pipes.")
+            else:
+                st.info("No Snowpipe activity detected in the selected period.")
+                
+        except Exception as e:
+            st.info(f"Snowpipe usage data unavailable: {str(e)}")
+            
+    except Exception as e:
+        st.error(f"Error fetching pipe data: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Query 4: Task Execution Reliability
+    st.subheader("4. Task Execution Reliability")
+    
+    query_task_history = f"""
+    SELECT 
+        name,
+        database_name,
+        schema_name,
+        state,
+        schedule,
+        error_integration,
+        created_on,
+        DATEDIFF(day, created_on, CURRENT_TIMESTAMP()) as task_age_days
+    FROM snowflake.account_usage.tasks
+    WHERE deleted_on IS NULL
+    ORDER BY database_name, schema_name, name
+    """
+    
+    try:
+        df_task_history = execute_query(query_task_history)
+        
+        if not df_task_history.empty:
+            # Calculate success/failure metrics
+            total_tasks = len(df_task_history)
+            started_tasks = len(df_task_history[df_task_history['STATE'] == 'started'])
+            suspended_tasks = len(df_task_history[df_task_history['STATE'] == 'suspended'])
+            tasks_with_error_int = len(df_task_history[df_task_history['ERROR_INTEGRATION'].notna()])
+            
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.metric("Total Tasks", total_tasks)
+            with col2:
+                st.metric("Started Tasks", started_tasks)
+            with col3:
+                st.metric("Suspended Tasks", suspended_tasks)
+            with col4:
+                st.metric("With Error Integration", tasks_with_error_int)
+            
+            # Task state distribution
+            state_counts = df_task_history['STATE'].value_counts()
+            fig_task_state = px.pie(
+                values=state_counts.values,
+                names=state_counts.index,
+                title='Task State Distribution',
+                hole=0.4
+            )
+            st.plotly_chart(fig_task_state, use_container_width=True)
+            
+            st.markdown("**Task Configuration:**")
+            st.dataframe(
+                df_task_history,
+                column_config={
+                    "NAME": "Task Name",
+                    "DATABASE_NAME": "Database",
+                    "SCHEMA_NAME": "Schema",
+                    "STATE": "State",
+                    "SCHEDULE": "Schedule",
+                    "ERROR_INTEGRATION": "Error Integration",
+                    "CREATED_ON": "Created",
+                    "TASK_AGE_DAYS": st.column_config.NumberColumn("Age (days)", format="%d")
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+            
+            # Check for tasks without error integration
+            tasks_no_error_int = df_task_history[df_task_history['ERROR_INTEGRATION'].isna()]
+            if not tasks_no_error_int.empty:
+                st.markdown('<div class="warning-card">', unsafe_allow_html=True)
+                st.warning(f"⚠️ **{len(tasks_no_error_int)} task(s) do not have error integration configured**. Consider setting up ERROR_INTEGRATION for failure notifications.")
+                st.markdown('</div>', unsafe_allow_html=True)
+            
+            # Query for task run history
+            query_task_runs = f"""
+            SELECT 
+                name,
+                database_name,
+                schema_name,
+                state,
+                COUNT(*) as run_count,
+                SUM(CASE WHEN state = 'SUCCEEDED' THEN 1 ELSE 0 END) as success_count,
+                SUM(CASE WHEN state = 'FAILED' THEN 1 ELSE 0 END) as failure_count,
+                AVG(scheduled_time_lag_seconds) as avg_lag_seconds
+            FROM snowflake.account_usage.task_history
+            WHERE scheduled_time >= DATEADD(day, -{days_back}, CURRENT_TIMESTAMP())
+            GROUP BY name, database_name, schema_name, state
+            ORDER BY failure_count DESC
+            LIMIT 20
+            """
+            
+            try:
+                df_task_runs = execute_query(query_task_runs)
+                
+                if not df_task_runs.empty:
+                    st.markdown("---")
+                    st.markdown("**Task Execution History:**")
+                    
+                    # Calculate success rate
+                    df_task_runs['SUCCESS_RATE'] = (df_task_runs['SUCCESS_COUNT'] / df_task_runs['RUN_COUNT'] * 100).round(2)
+                    
+                    # Show tasks with failures
+                    tasks_with_failures = df_task_runs[df_task_runs['FAILURE_COUNT'] > 0]
+                    
+                    if not tasks_with_failures.empty:
+                        st.markdown('<div class="warning-card">', unsafe_allow_html=True)
+                        st.warning(f"⚠️ **{len(tasks_with_failures)} task(s) have failures in the selected period**")
+                        st.dataframe(
+                            tasks_with_failures,
+                            column_config={
+                                "NAME": "Task Name",
+                                "DATABASE_NAME": "Database",
+                                "SCHEMA_NAME": "Schema",
+                                "STATE": "State",
+                                "RUN_COUNT": st.column_config.NumberColumn("Total Runs", format="%d"),
+                                "SUCCESS_COUNT": st.column_config.NumberColumn("Successes", format="%d"),
+                                "FAILURE_COUNT": st.column_config.NumberColumn("Failures", format="%d"),
+                                "SUCCESS_RATE": st.column_config.NumberColumn("Success Rate %", format="%.2f"),
+                                "AVG_LAG_SECONDS": st.column_config.NumberColumn("Avg Lag (sec)", format="%.1f")
+                            },
+                            hide_index=True,
+                            use_container_width=True
+                        )
+                        st.markdown('</div>', unsafe_allow_html=True)
+                    else:
+                        st.success("✅ All tasks executed successfully in the selected period.")
+                    
+                else:
+                    st.info("No task execution history found in the selected period.")
+                    
+            except Exception as e:
+                st.info(f"Task execution history unavailable: {str(e)}")
+            
+            st.info("💡 **Tip**: Configure ERROR_INTEGRATION for tasks to receive notifications on failures. Monitor task lag to ensure timely execution.")
+        else:
+            st.info("✅ No tasks found in the account.")
+            
+    except Exception as e:
+        st.error(f"Error fetching task data: {str(e)}")
+
 # ============================================================================
 # TAB 3: OPERATIONAL EXCELLENCE
 # ============================================================================
@@ -1154,23 +1468,48 @@ with tab3:
         # Rename columns for consistency - handle both quoted and unquoted column names
         column_mapping = {}
         for col in df_wh_config.columns:
-            col_lower = col.lower()
-            if col_lower == 'name':
+            # Strip quotes and convert to lowercase for comparison
+            col_clean = col.strip('"').lower()
+            if col_clean == 'name':
                 column_mapping[col] = 'WAREHOUSE_NAME'
-            elif col_lower == 'size':
+            elif col_clean == 'size':
                 column_mapping[col] = 'WAREHOUSE_SIZE'
-            elif col_lower == 'type':
+            elif col_clean == 'type':
                 column_mapping[col] = 'WAREHOUSE_TYPE'
-            elif col_lower == 'auto_suspend':
+            elif col_clean == 'auto_suspend':
                 column_mapping[col] = 'AUTO_SUSPEND'
-            elif col_lower == 'auto_resume':
+            elif col_clean == 'auto_resume':
                 column_mapping[col] = 'AUTO_RESUME'
+            elif col_clean == 'min_cluster_count':
+                column_mapping[col] = 'MIN_CLUSTER_COUNT'
+            elif col_clean == 'max_cluster_count':
+                column_mapping[col] = 'MAX_CLUSTER_COUNT'
+            elif col_clean == 'scaling_policy':
+                column_mapping[col] = 'SCALING_POLICY'
         
         df_wh_config.rename(columns=column_mapping, inplace=True)
         
+        # Ensure required columns exist (fallback if mapping didn't work)
+        if 'AUTO_SUSPEND' not in df_wh_config.columns:
+            # Try to find the actual column name
+            for col in df_wh_config.columns:
+                if 'suspend' in col.strip('"').lower():
+                    df_wh_config['AUTO_SUSPEND'] = df_wh_config[col]
+                    break
+        
+        if 'AUTO_RESUME' not in df_wh_config.columns:
+            for col in df_wh_config.columns:
+                if 'resume' in col.strip('"').lower():
+                    df_wh_config['AUTO_RESUME'] = df_wh_config[col]
+                    break
+        
         # Check for warehouses without auto-suspend (NULL or 0)
-        no_auto_suspend = df_wh_config[df_wh_config['AUTO_SUSPEND'].isnull() | (df_wh_config['AUTO_SUSPEND'] == 0)]
-        long_auto_suspend = df_wh_config[df_wh_config['AUTO_SUSPEND'] > 600]
+        if 'AUTO_SUSPEND' in df_wh_config.columns:
+            no_auto_suspend = df_wh_config[df_wh_config['AUTO_SUSPEND'].isnull() | (df_wh_config['AUTO_SUSPEND'] == 0)]
+            long_auto_suspend = df_wh_config[df_wh_config['AUTO_SUSPEND'] > 600]
+        else:
+            no_auto_suspend = pd.DataFrame()
+            long_auto_suspend = pd.DataFrame()
         
         col1, col2, col3 = st.columns(3)
         
@@ -1184,17 +1523,235 @@ with tab3:
         if len(no_auto_suspend) > 0:
             st.markdown('<div class="danger-card">', unsafe_allow_html=True)
             st.error(f"⚠️ **Critical**: {len(no_auto_suspend)} warehouse(s) without auto-suspend will run continuously!")
-            st.dataframe(no_auto_suspend[['WAREHOUSE_NAME', 'WAREHOUSE_SIZE', 'AUTO_SUSPEND', 'AUTO_RESUME']], hide_index=True)
+            display_cols = ['WAREHOUSE_NAME', 'WAREHOUSE_SIZE']
+            if 'AUTO_SUSPEND' in no_auto_suspend.columns:
+                display_cols.append('AUTO_SUSPEND')
+            if 'AUTO_RESUME' in no_auto_suspend.columns:
+                display_cols.append('AUTO_RESUME')
+            st.dataframe(no_auto_suspend[display_cols], hide_index=True)
             st.markdown('</div>', unsafe_allow_html=True)
         
         if len(long_auto_suspend) > 0:
             st.markdown('<div class="warning-card">', unsafe_allow_html=True)
             st.warning(f"⚠️ **Recommendation**: {len(long_auto_suspend)} warehouse(s) have auto-suspend > 10 minutes. Consider reducing to 60-300 seconds for cost optimization.")
-            st.dataframe(long_auto_suspend[['WAREHOUSE_NAME', 'WAREHOUSE_SIZE', 'AUTO_SUSPEND']], hide_index=True)
+            display_cols = ['WAREHOUSE_NAME', 'WAREHOUSE_SIZE']
+            if 'AUTO_SUSPEND' in long_auto_suspend.columns:
+                display_cols.append('AUTO_SUSPEND')
+            st.dataframe(long_auto_suspend[display_cols], hide_index=True)
             st.markdown('</div>', unsafe_allow_html=True)
         
         if len(no_auto_suspend) == 0 and len(long_auto_suspend) == 0:
             st.success("✅ All warehouses have appropriate auto-suspend configuration.")
+        
+        # Display full configuration
+        st.markdown("**Warehouse Configuration Details:**")
+        column_config = {}
+        if 'WAREHOUSE_NAME' in df_wh_config.columns:
+            column_config["WAREHOUSE_NAME"] = "Warehouse"
+        if 'WAREHOUSE_SIZE' in df_wh_config.columns:
+            column_config["WAREHOUSE_SIZE"] = "Size"
+        if 'WAREHOUSE_TYPE' in df_wh_config.columns:
+            column_config["WAREHOUSE_TYPE"] = "Type"
+        if 'AUTO_SUSPEND' in df_wh_config.columns:
+            column_config["AUTO_SUSPEND"] = "Auto-Suspend (sec)"
+        if 'AUTO_RESUME' in df_wh_config.columns:
+            column_config["AUTO_RESUME"] = "Auto-Resume"
+        if 'MIN_CLUSTER_COUNT' in df_wh_config.columns:
+            column_config["MIN_CLUSTER_COUNT"] = "Min Clusters"
+        if 'MAX_CLUSTER_COUNT' in df_wh_config.columns:
+            column_config["MAX_CLUSTER_COUNT"] = "Max Clusters"
+        if 'SCALING_POLICY' in df_wh_config.columns:
+            column_config["SCALING_POLICY"] = "Scaling Policy"
+        
+        st.dataframe(
+            df_wh_config,
+            column_config=column_config,
+            hide_index=True,
+            use_container_width=True
+        )
+        
+        # Warehouse Idle Time Analysis
+        st.markdown("---")
+        st.markdown("**Warehouse Idle Time & Cost Analysis:**")
+        
+        query_idle_time = f"""
+        SELECT
+            warehouse_name,
+            SUM(credits_used_compute) as total_compute_credits,
+            SUM(credits_attributed_compute_queries) as query_credits,
+            (SUM(credits_used_compute) - SUM(credits_attributed_compute_queries)) as idle_credits,
+            CASE 
+                WHEN SUM(credits_used_compute) > 0 
+                THEN ((SUM(credits_used_compute) - SUM(credits_attributed_compute_queries)) / 
+                      SUM(credits_used_compute)) * 100
+                ELSE 0 
+            END as idle_pct
+        FROM snowflake.account_usage.warehouse_metering_history
+        WHERE start_time >= DATEADD(day, -{days_back}, CURRENT_TIMESTAMP())
+        GROUP BY warehouse_name
+        HAVING idle_credits > 0
+        ORDER BY idle_credits DESC
+        """
+        
+        try:
+            df_idle = execute_query(query_idle_time)
+            
+            if not df_idle.empty:
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    fig_idle_credits = px.bar(
+                        df_idle.head(10),
+                        x='WAREHOUSE_NAME',
+                        y='IDLE_CREDITS',
+                        title='Top 10 Warehouses by Idle Credits',
+                        labels={'IDLE_CREDITS': 'Idle Credits', 'WAREHOUSE_NAME': 'Warehouse'},
+                        color='IDLE_CREDITS',
+                        color_continuous_scale='Reds'
+                    )
+                    st.plotly_chart(fig_idle_credits, use_container_width=True)
+                
+                with col2:
+                    fig_idle_pct = px.bar(
+                        df_idle.head(10),
+                        x='WAREHOUSE_NAME',
+                        y='IDLE_PCT',
+                        title='Top 10 Warehouses by Idle Time %',
+                        labels={'IDLE_PCT': 'Idle Time %', 'WAREHOUSE_NAME': 'Warehouse'},
+                        color='IDLE_PCT',
+                        color_continuous_scale='Oranges'
+                    )
+                    st.plotly_chart(fig_idle_pct, use_container_width=True)
+                
+                # Summary metrics
+                total_idle_credits = df_idle['IDLE_CREDITS'].sum()
+                total_compute_credits = df_idle['TOTAL_COMPUTE_CREDITS'].sum()
+                avg_idle_pct = df_idle['IDLE_PCT'].mean()
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Total Idle Credits", f"{total_idle_credits:.2f}")
+                with col2:
+                    st.metric("Total Compute Credits", f"{total_compute_credits:.2f}")
+                with col3:
+                    st.metric("Avg Idle %", f"{avg_idle_pct:.1f}%")
+                
+                st.markdown("**Detailed Idle Time Analysis:**")
+                st.dataframe(
+                    df_idle,
+                    column_config={
+                        "WAREHOUSE_NAME": "Warehouse",
+                        "TOTAL_COMPUTE_CREDITS": st.column_config.NumberColumn("Total Credits", format="%.2f"),
+                        "QUERY_CREDITS": st.column_config.NumberColumn("Query Credits", format="%.2f"),
+                        "IDLE_CREDITS": st.column_config.NumberColumn("Idle Credits", format="%.2f"),
+                        "IDLE_PCT": st.column_config.NumberColumn("Idle %", format="%.1f")
+                    },
+                    hide_index=True,
+                    use_container_width=True
+                )
+                
+                # Check for high idle time
+                high_idle = df_idle[df_idle['IDLE_PCT'] > 20]
+                if not high_idle.empty:
+                    st.markdown('<div class="warning-card">', unsafe_allow_html=True)
+                    st.warning(f"⚠️ **{len(high_idle)} warehouse(s) have >20% idle time**. Consider reducing auto-suspend timeout to minimize idle costs.")
+                    st.markdown('</div>', unsafe_allow_html=True)
+                
+                # Hourly idle pattern analysis for top 5 warehouses
+                st.markdown("---")
+                st.markdown("**Hourly Idle Patterns - Last 7 Days (Top 5 Warehouses):**")
+                
+                # Get top 5 warehouses by idle credits
+                top5_warehouses = df_idle.head(5)['WAREHOUSE_NAME'].tolist()
+                
+                query_hourly_idle = f"""
+                WITH hourly_usage AS (
+                    SELECT
+                        warehouse_name,
+                        HOUR(start_time) as hour_of_day,
+                        SUM(credits_used_compute) as total_compute_credits,
+                        SUM(credits_attributed_compute_queries) as query_credits,
+                        (SUM(credits_used_compute) - SUM(credits_attributed_compute_queries)) as idle_credits
+                    FROM snowflake.account_usage.warehouse_metering_history
+                    WHERE start_time >= DATEADD(day, -7, CURRENT_TIMESTAMP())
+                        AND warehouse_name IN ('{"','".join(top5_warehouses)}')
+                    GROUP BY warehouse_name, HOUR(start_time)
+                )
+                SELECT
+                    warehouse_name,
+                    hour_of_day,
+                    idle_credits,
+                    CASE 
+                        WHEN total_compute_credits > 0 
+                        THEN (idle_credits / total_compute_credits) * 100
+                        ELSE 0 
+                    END as idle_pct
+                FROM hourly_usage
+                WHERE idle_credits > 0
+                ORDER BY warehouse_name, hour_of_day
+                """
+                
+                try:
+                    df_hourly_idle = execute_query(query_hourly_idle)
+                    
+                    if not df_hourly_idle.empty:
+                        # Create pivot table for heatmap
+                        df_pivot = df_hourly_idle.pivot(
+                            index='WAREHOUSE_NAME',
+                            columns='HOUR_OF_DAY',
+                            values='IDLE_PCT'
+                        ).fillna(0)
+                        
+                        # Ensure all hours 0-23 are present
+                        for hour in range(24):
+                            if hour not in df_pivot.columns:
+                                df_pivot[hour] = 0
+                        df_pivot = df_pivot.sort_index(axis=1)
+                        
+                        # Create heatmap
+                        fig_heatmap = px.imshow(
+                            df_pivot,
+                            labels=dict(x="Hour of Day", y="Warehouse", color="Idle %"),
+                            x=[f"{h:02d}:00" for h in range(24)],
+                            y=df_pivot.index,
+                            aspect="auto",
+                            color_continuous_scale="Reds",
+                            title="Idle Time Patterns by Hour of Day - Last 7 Days (Top 5 Warehouses)"
+                        )
+                        fig_heatmap.update_layout(height=400)
+                        st.plotly_chart(fig_heatmap, use_container_width=True)
+                        
+                        # Create line chart as alternative view
+                        fig_line = px.line(
+                            df_hourly_idle,
+                            x='HOUR_OF_DAY',
+                            y='IDLE_PCT',
+                            color='WAREHOUSE_NAME',
+                            title='Idle Time % Throughout the Day - Last 7 Days (Top 5 Warehouses)',
+                            labels={'HOUR_OF_DAY': 'Hour of Day', 'IDLE_PCT': 'Idle Time %', 'WAREHOUSE_NAME': 'Warehouse'},
+                            markers=True
+                        )
+                        fig_line.update_xaxes(
+                            tickmode='linear',
+                            tick0=0,
+                            dtick=2,
+                            range=[0, 23]
+                        )
+                        st.plotly_chart(fig_line, use_container_width=True)
+                        
+                        st.info("💡 **Insight**: The heatmap and line chart show when warehouses are idle throughout the day. Dark red areas indicate high idle time. Consider adjusting auto-suspend timeouts or scheduling queries to avoid idle periods.")
+                    else:
+                        st.info("Insufficient hourly data for idle pattern analysis.")
+                        
+                except Exception as e:
+                    st.info(f"Hourly idle pattern analysis unavailable: {str(e)}")
+                
+                st.info("💡 **Tip**: Idle time occurs when warehouses are running but not executing queries. Reduce auto-suspend timeouts (60-300 seconds) to minimize idle credits.")
+            else:
+                st.info("No idle time detected or insufficient data for analysis.")
+                
+        except Exception as e:
+            st.info(f"Idle time analysis unavailable: {str(e)}")
             
     except Exception as e:
         st.error(f"Error fetching warehouse configuration: {str(e)}")
@@ -1260,6 +1817,55 @@ with tab3:
             
     except Exception as e:
         st.error(f"Error fetching long-running queries: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Query 4: Query Execution Patterns
+    st.subheader("4. Query Execution Patterns")
+    
+    query_patterns = f"""
+    SELECT 
+        user_name,
+        query_type,
+        COUNT(*) as query_count,
+        AVG(execution_time) / 1000 as avg_execution_time_sec,
+        COUNT(DISTINCT warehouse_name) as warehouses_used
+    FROM snowflake.account_usage.query_history
+    WHERE start_time >= DATEADD(day, -{days_back}, CURRENT_TIMESTAMP())
+    GROUP BY user_name, query_type
+    ORDER BY query_count DESC
+    LIMIT 30
+    """
+    
+    try:
+        df_patterns = execute_query(query_patterns)
+        
+        if not df_patterns.empty:
+            fig_users = px.bar(
+                df_patterns.head(15),
+                x='USER_NAME',
+                y='QUERY_COUNT',
+                color='QUERY_TYPE',
+                title='Top Users by Query Volume',
+                labels={'QUERY_COUNT': 'Number of Queries', 'USER_NAME': 'User', 'QUERY_TYPE': 'Query Type'}
+            )
+            st.plotly_chart(fig_users, use_container_width=True)
+            
+            st.dataframe(
+                df_patterns.head(20),
+                column_config={
+                    "USER_NAME": "User",
+                    "QUERY_TYPE": "Query Type",
+                    "QUERY_COUNT": "Query Count",
+                    "AVG_EXECUTION_TIME_SEC": st.column_config.NumberColumn("Avg Exec Time (sec)", format="%.2f"),
+                    "WAREHOUSES_USED": "Warehouses Used"
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+            
+    except Exception as e:
+        st.error(f"Error fetching query patterns: {str(e)}")
 
 # ============================================================================
 # TAB 4: SECURITY & GOVERNANCE
@@ -1364,8 +1970,165 @@ with tab4:
     
     st.markdown("---")
     
-    # Query 3: Failed Login Attempts
-    st.subheader("3. Failed Authentication Attempts")
+    # Query 3: Privileged Access Monitoring
+    st.subheader("3. Privileged Access Monitoring")
+    
+    query_privileged_roles = """
+    WITH Active_Queries AS (
+        SELECT
+            SESSION_ID,
+            USER_NAME,
+            ROLE_NAME,
+            start_time,
+            -- Rank the queries for each session by start time (most recent first)
+            ROW_NUMBER() OVER (PARTITION BY SESSION_ID ORDER BY start_time DESC) as rn
+        FROM
+            SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+        WHERE
+            -- Filter for sessions that have had activity recently (e.g., in the last 4 hours, which is the default idle timeout)
+            start_time >= DATEADD(hour, -4, CURRENT_TIMESTAMP())
+            -- Ensure the query is not currently running for better performance (optional)
+            AND EXECUTION_STATUS != 'RUNNING'
+    )
+    SELECT
+        S.SESSION_ID,
+        S.USER_NAME,
+        AQ.ROLE_NAME AS CURRENT_ACTIVE_ROLE,
+        S.CLIENT_APPLICATION_ID,
+        AQ.start_time AS LAST_ACTIVITY_TIME
+    FROM
+        SNOWFLAKE.ACCOUNT_USAGE.SESSIONS S
+    INNER JOIN
+        Active_Queries AQ
+        ON S.SESSION_ID = AQ.SESSION_ID
+    WHERE
+        -- Select only the latest query for each session
+        AQ.rn = 1
+        -- Filter sessions that were created recently (e.g., last 7 days)
+        AND S.CREATED_ON >= DATEADD(day, -7, CURRENT_TIMESTAMP())
+    ORDER BY
+        LAST_ACTIVITY_TIME DESC
+    """
+    
+    try:
+        df_priv_roles = execute_query(query_privileged_roles)
+        
+        if not df_priv_roles.empty:
+            # Filter for privileged roles
+            privileged_roles = ['ACCOUNTADMIN', 'SECURITYADMIN', 'SYSADMIN']
+            df_privileged = df_priv_roles[df_priv_roles['CURRENT_ACTIVE_ROLE'].isin(privileged_roles)]
+            
+            if not df_privileged.empty:
+                # Summary metrics
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Active Sessions", len(df_privileged))
+                with col2:
+                    st.metric("Unique Users", df_privileged['USER_NAME'].nunique())
+                with col3:
+                    st.metric("ACCOUNTADMIN Sessions", len(df_privileged[df_privileged['CURRENT_ACTIVE_ROLE'] == 'ACCOUNTADMIN']))
+                with col4:
+                    st.metric("Total Active Sessions (All Roles)", len(df_priv_roles))
+                
+                # Chart: Sessions by Role
+                role_counts = df_privileged['CURRENT_ACTIVE_ROLE'].value_counts().reset_index()
+                role_counts.columns = ['ROLE', 'SESSION_COUNT']
+                
+                fig_priv = px.bar(
+                    role_counts,
+                    x='ROLE',
+                    y='SESSION_COUNT',
+                    title='Active Privileged Sessions by Role',
+                    labels={'SESSION_COUNT': 'Active Sessions', 'ROLE': 'Privileged Role'},
+                    color='ROLE',
+                    color_discrete_map={
+                        'ACCOUNTADMIN': '#FF4B4B',
+                        'SECURITYADMIN': '#FFA500',
+                        'SYSADMIN': '#FFD700'
+                    }
+                )
+                st.plotly_chart(fig_priv, use_container_width=True)
+                
+                st.markdown("**Active Privileged Sessions:**")
+                st.dataframe(
+                    df_privileged.head(50),
+                    column_config={
+                        "SESSION_ID": "Session ID",
+                        "USER_NAME": "User",
+                        "CURRENT_ACTIVE_ROLE": "Active Role",
+                        "CLIENT_APPLICATION_ID": "Client Application",
+                        "LAST_ACTIVITY_TIME": st.column_config.DatetimeColumn(
+                            "Last Activity",
+                            format="DD/MM/YYYY HH:mm:ss"
+                        )
+                    },
+                    hide_index=True,
+                    use_container_width=True
+                )
+                
+                st.info("💡 **Tip**: Monitor privileged role usage closely. Active sessions show users currently using privileged roles. Consider implementing role-based access with least privilege principle and session timeout policies.")
+            else:
+                st.info("No active privileged role sessions found in the last 4 hours.")
+        else:
+            st.info("No active sessions found in the selected period.")
+            
+    except Exception as e:
+        st.error(f"Error fetching privileged role data: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Query 4: Data Masking Policies
+    st.subheader("4. Data Protection & Masking")
+    
+    query_masking = """
+    SELECT 
+        policy_name,
+        policy_kind,
+        policy_db,
+        policy_schema
+    FROM snowflake.account_usage.policy_references
+    WHERE policy_kind IN ('MASKING_POLICY', 'ROW_ACCESS_POLICY')
+    ORDER BY policy_kind, policy_name
+    """
+    
+    try:
+        df_masking = execute_query(query_masking)
+        
+        if not df_masking.empty:
+            masking_count = len(df_masking[df_masking['POLICY_KIND'] == 'MASKING_POLICY'])
+            row_access_count = len(df_masking[df_masking['POLICY_KIND'] == 'ROW_ACCESS_POLICY'])
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Masking Policies", masking_count)
+            with col2:
+                st.metric("Row Access Policies", row_access_count)
+            
+            st.success(f"✅ {len(df_masking)} data protection polic(ies) in place")
+            
+            st.dataframe(
+                df_masking,
+                column_config={
+                    "POLICY_NAME": "Policy Name",
+                    "POLICY_KIND": "Policy Type",
+                    "POLICY_CATALOG": "Database",
+                    "POLICY_SCHEMA": "Schema"
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+        else:
+            st.markdown('<div class="warning-card">', unsafe_allow_html=True)
+            st.warning("⚠️ **Recommendation**: No masking or row access policies detected. Implement data masking for sensitive data (PII, PHI, financial data).")
+            st.markdown('</div>', unsafe_allow_html=True)
+            
+    except Exception as e:
+        st.error(f"Error fetching masking policies: {str(e)}")
+    
+    st.markdown("---")
+    
+    # Query 5: Failed Login Attempts
+    st.subheader("5. Failed Authentication Attempts")
     
     query_failed_logins = f"""
     SELECT 
